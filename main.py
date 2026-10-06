@@ -402,7 +402,7 @@ class NeteaseUnblockPlugin(Star):
                 asyncio.create_task(self._delete_later(path, self.delete_file_seconds))
 
     async def _fetch_lyrics(self, song_id) -> str | None:
-        """抓取网易云 LRC 歌词，无歌词返回 None。"""
+        """获取网易云 LRC 歌词，无歌词返回 None。"""
         try:
             resp = await self._search_client.get(LYRIC_API, params={"id": str(song_id), "lv": 1})
             resp.raise_for_status()
