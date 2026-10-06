@@ -522,14 +522,12 @@ class NeteaseUnblockPlugin(Star):
                 logger.warning(f"[netease_unblock] 清理语音临时文件失败: {e}")
 
     async def _download_song(self, song: dict, url: str) -> Path:
-        """流式下载歌曲，按「歌名 - 歌手.格式」命名。"""
+        """流式下载歌曲，按「歌名.格式」命名。"""
         self._sweep_stale_downloads()
         ext = PurePosixPath(urlparse(url).path).suffix.lstrip(".").lower()
         if ext not in AUDIO_EXTS:
             ext = "mp3"
-        stem = self._sanitize_filename(
-            f"{song['name']} - {song['artists']}" if song.get("artists") else song["name"]
-        )
+        stem = self._sanitize_filename(song["name"])
         target = self._download_dir / f"{stem}.{ext}"
 
         tmp = self._download_dir / f".{uuid.uuid4().hex}.part"
