@@ -360,9 +360,17 @@ class NeteaseUnblockPlugin(Star):
 
         yield event.plain_result(text)
 
+    async def _progress(self, event: AstrMessageEvent, text: str):
+        """进度提示：aiocqhttp 平台直发并定时撤回，否则普通发送。"""
+        if self.retract_seconds > 0 and event.get_platform_name() == "aiocqhttp" and hasattr(event, "bot"):
+            if await self._send_and_schedule_retract(event, text, self.retract_seconds):
+                return
+        yield event.plain_result(text)
+
     async def _send_file(self, event: AstrMessageEvent, song: dict, audio: str):
         """下载音乐并以文件形式发送，内嵌歌词后定时删除本地文件。"""
-        yield event.plain_result(f"⏳ 正在下载「{song['name']}」，请稍候…")
+        async for r in self._progress(event, f"⏳ 正在下载「{song['name']}」，请稍候…"):
+            yield r
         try:
             path = await self._download_song(song, audio)
         except Exception as e:
@@ -444,7 +452,8 @@ class NeteaseUnblockPlugin(Star):
 
     async def _send_voice(self, event: AstrMessageEvent, song: dict, audio: str):
         """下载并以语音（Record）形式发送，发送完成立即清理临时文件。"""
-        yield event.plain_result(f"⏳ 正在获取「{song['name']}」语音，请稍候…")
+        async for r in self._progress(event, f"⏳ 正在获取「{song['name']}」语音，请稍候…"):
+            yield r
         try:
             path = await self._download_song(song, audio)
         except Exception as e:
