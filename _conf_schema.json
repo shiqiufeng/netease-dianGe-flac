@@ -56,9 +56,9 @@
     "default": 60
   },
   "embed_lyrics": {
-    "description": "文件内嵌歌词",
+    "description": "文件内嵌歌词与封面",
     "type": "bool",
-    "hint": "文件模式下载后把 LRC 歌词和歌名/歌手/专辑标签写入音频文件（FLAC/MP3/M4A）。",
+    "hint": "文件模式下载后把 LRC 歌词、专辑封面和歌名/歌手/专辑标签写入音频文件（FLAC/MP3/M4A）。",
     "default": true
   },
   "auto_pick": {

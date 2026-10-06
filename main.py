@@ -379,10 +379,11 @@ class NeteaseUnblockPlugin(Star):
             return
         if self.embed_lyrics:
             lrc = await self._fetch_lyrics(song["id"])
-            if lrc:
-                ok = await asyncio.to_thread(self._embed_lyrics, path, song, lrc)
+            cover = await self._fetch_cover(song)
+            if lrc or cover:
+                ok = await asyncio.to_thread(self._embed_tags, path, song, lrc, cover)
                 if ok:
-                    logger.info(f"[netease_unblock] 已内嵌歌词: {path.name}")
+                    logger.info(f"[netease_unblock] 已内嵌歌词/封面/标签: {path.name}")
         try:
             yield event.chain_result([File(name=path.name, file=str(path))])
         except Exception as e:
@@ -403,26 +404,57 @@ class NeteaseUnblockPlugin(Star):
             return None
         return lrc.strip() or None
 
-    def _embed_lyrics(self, path: Path, song: dict, lrc: str) -> bool:
-        """把 LRC 歌词与标题/歌手/专辑标签写入音频文件（同步阻塞，调用方放线程里跑）。"""
+    async def _fetch_cover(self, song: dict):
+        """下载专辑封面原图（去掉缩略图参数取最高画质），返回 (bytes, mime) 或 None。"""
+        url = song.get("cover") or ""
+        if not url.startswith("http"):
+            return None
+        url = url.split("?")[0]  # 剥掉缩略图参数，取原始分辨率
+        try:
+            resp = await self._search_client.get(url)
+            resp.raise_for_status()
+            data = resp.content
+        except Exception as e:
+            logger.warning(f"[netease_unblock] 封面下载失败: {e!r}")
+            return None
+        if not data or len(data) < 1024:
+            return None
+        mime = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
+        return data, mime
+
+    def _embed_tags(self, path: Path, song: dict, lrc: str | None, cover: tuple | None) -> bool:
+        """把 LRC 歌词、封面原图与标题/歌手/专辑标签写入音频文件（同步阻塞，调用方放线程里跑）。"""
         if mutagen is None:
             logger.warning("[netease_unblock] 未安装 mutagen，跳过歌词内嵌")
             return False
+        cover_bytes = cover[0] if cover else None
+        cover_mime = cover[1] if cover else "image/jpeg"
         title = song.get("name") or ""
         artist = song.get("artists") or ""
         album = song.get("album") or ""
         try:
-            from mutagen.flac import FLAC
-            from mutagen.id3 import ID3, ID3NoHeaderError, TALB, TIT2, TPE1, USLT
-            from mutagen.mp4 import MP4
+            from mutagen.flac import FLAC, Picture
+            from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TALB, TIT2, TPE1, USLT
+            from mutagen.mp4 import MP4, MP4Cover
 
             suffix = path.suffix.lower()
             if suffix == ".flac":
                 f = FLAC(str(path))
-                f["LYRICS"] = lrc
+                if lrc:
+                    # LYRICS 兼容飞傲/foobar 等播放器，UNSYNCEDLYRICS 是标准字段名
+                    f["LYRICS"] = lrc
+                    f["UNSYNCEDLYRICS"] = lrc
                 f["title"] = title
                 f["artist"] = artist
                 f["album"] = album
+                if cover_bytes:
+                    pic = Picture()
+                    pic.type = 3  # front cover
+                    pic.mime = cover_mime
+                    pic.desc = "Cover"
+                    pic.data = cover_bytes
+                    f.clear_pictures()
+                    f.add_picture(pic)
                 f.save()
                 return True
             if suffix == ".mp3":
@@ -430,18 +462,26 @@ class NeteaseUnblockPlugin(Star):
                     tags = ID3(str(path))
                 except ID3NoHeaderError:
                     tags = ID3()
-                tags.setall("USLT", [USLT(encoding=3, lang="chi", desc="歌词", text=lrc)])
+                if lrc:
+                    tags.setall("USLT", [USLT(encoding=3, lang="chi", desc="歌词", text=lrc)])
                 tags.add(TIT2(encoding=3, text=title))
                 tags.add(TPE1(encoding=3, text=artist))
                 tags.add(TALB(encoding=3, text=album))
+                if cover_bytes:
+                    tags.delall("APIC")
+                    tags.add(APIC(encoding=3, mime=cover_mime, type=3, desc="Cover", data=cover_bytes))
                 tags.save(str(path), v2_version=3)
                 return True
             if suffix in (".m4a", ".mp4"):
                 f = MP4(str(path))
-                f["\xa9lyr"] = [lrc]
+                if lrc:
+                    f["\xa9lyr"] = [lrc]
                 f["\xa9nam"] = [title]
                 f["\xa9ART"] = [artist]
                 f["\xa9alb"] = [album]
+                if cover_bytes:
+                    img_fmt = MP4Cover.FORMAT_PNG if cover_mime == "image/png" else MP4Cover.FORMAT_JPEG
+                    f["covr"] = [MP4Cover(cover_bytes, imageformat=img_fmt)]
                 f.save()
                 return True
             logger.info(f"[netease_unblock] 格式 {suffix} 暂不支持内嵌歌词，跳过")
