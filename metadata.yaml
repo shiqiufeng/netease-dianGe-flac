@@ -3,4 +3,4 @@ display_name: 网易云点歌·解锁
 desc: 网易云点歌插件：搜索网易云音乐，调用自部署 UnblockNeteaseMusic-utils 解锁受限歌曲直链，发送可播放的 QQ 音乐卡片。
 version: v1.4.0
 author: "流水, 听雨的蛙, 落雪, GLM-5.3-Flash"
-repo: https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils
+repo: https://github.com/shiqiufeng/astrbot_plugin_netease_unblock
