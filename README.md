@@ -1,6 +1,6 @@
-# 网易云点歌·解锁
+# 网易云音乐点歌-flac
 
-AstrBot 网易云点歌插件：搜索网易云音乐，配合你自部署的 [UnblockNeteaseMusic-utils](https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils) 解锁服务获取可播放直链，支持 QQ 音乐卡片 / 音乐文件 / 文本链接三种发送方式。
+AstrBot 网易云音乐点歌-flac 插件：搜索网易云音乐，配合你自部署的 [UnblockNeteaseMusic-utils](https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils) 解锁服务获取可播放直链，支持 QQ 音乐卡片 / 音乐文件 / 语音 / 文本链接四种发送方式。
 
 > 插件不含任何解锁服务器地址，`API 地址` 由使用者自行部署、自行填写，部署教程见下文。
 
@@ -87,7 +87,7 @@ curl "<你的API地址>/match?id=1498523311" # 应返回包含直链的 JSON
 
 ## 安装插件
 
-1. 在本仓库 **Releases** 下载最新的 `网易云点歌.zip`；
+1. 在本仓库 **Releases** 下载最新的附件（`网易云音乐点歌-flac`）；
 2. AstrBot WebUI → 插件管理 → 从文件安装，选择该 zip；
 3. 在插件配置里把 `API 地址` 填成你的解锁服务地址，重载插件即可使用。
 

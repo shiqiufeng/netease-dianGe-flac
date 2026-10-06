@@ -1,4 +1,4 @@
-"""AstrBot 网易云点歌插件（UnblockNeteaseMusic 解锁版）。
+"""AstrBot 网易云音乐点歌-flac 插件（UnblockNeteaseMusic 解锁版）。
 
 工作流程：
 1. 通过网易云音乐公开 Web 接口按关键词搜索歌曲；
@@ -85,7 +85,7 @@ class NeteaseCardMusic(Music):
 
 
 class NeteaseUnblockPlugin(Star):
-    """网易云点歌 + UnblockNeteaseMusic 解锁。"""
+    """网易云音乐点歌-flac：网易云搜索 + UnblockNeteaseMusic 解锁。"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -635,7 +635,7 @@ class NeteaseUnblockPlugin(Star):
     async def _help_flow(self, event: AstrMessageEvent):
         mode = self.send_mode
         tips = (
-            "🎵 网易云点歌·解锁\n"
+            "🎵 网易云音乐点歌-flac\n"
             "══════════════════\n"
             "📖 命令（加不加 / 前缀均可）\n"
             "点歌 <歌名>　　　搜索歌曲，回复序号选择\n"
