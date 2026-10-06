@@ -380,6 +380,14 @@ class NeteaseUnblockPlugin(Star):
         if self.embed_lyrics:
             lrc = await self._fetch_lyrics(song["id"])
             cover = await self._fetch_cover(song)
+            if not cover:
+                # 搜索接口对部分歌曲不给封面地址，从歌曲详情接口补
+                try:
+                    detail = await self._get_song_detail(song["id"])
+                    if detail:
+                        cover = await self._fetch_cover(detail)
+                except Exception as e:
+                    logger.warning(f"[netease_unblock] 详情接口补封面失败: {e!r}")
             if lrc or cover:
                 ok = await asyncio.to_thread(self._embed_tags, path, song, lrc, cover)
                 if ok:
@@ -407,7 +415,8 @@ class NeteaseUnblockPlugin(Star):
     async def _fetch_cover(self, song: dict):
         """下载专辑封面原图（去掉缩略图参数取最高画质），返回 (bytes, mime) 或 None。"""
         url = song.get("cover") or ""
-        if not url.startswith("http"):
+        if not url.startswith("http") or "5639395138885805" in url:
+            # 5639395138885805 是网易云的默认占位封面，等于没有封面
             return None
         url = url.split("?")[0]  # 剥掉缩略图参数，取原始分辨率
         try:
