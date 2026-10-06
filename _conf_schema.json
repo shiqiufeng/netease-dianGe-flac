@@ -1,0 +1,75 @@
+{
+  "unlock_api": {
+    "description": "API 地址",
+    "type": "string",
+    "hint": "UnblockNeteaseMusic-utils 部署地址，末尾不带 /。项目地址与部署教程：https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils 。留空则插件不可用。",
+    "default": "",
+    "obvious_hint": true
+  },
+  "proxy": {
+    "description": "解锁请求代理",
+    "type": "string",
+    "hint": "访问解锁服务走的 HTTP 代理，如 http://127.0.0.1:7897（Clash Verge 默认端口）。留空直连。仅解锁走代理，搜索仍直连。",
+    "default": ""
+  },
+  "source": {
+    "description": "音源优先级",
+    "type": "string",
+    "hint": "逗号分隔按顺序尝试：byfuns/ddyr 默认请求无损优先，auto=服务端自动（bugpk 兜底，仅免费歌可用）。如 byfuns,ddyr,auto",
+    "default": "byfuns,ddyr,auto"
+  },
+  "verify_audio": {
+    "description": "校验音频直链",
+    "type": "bool",
+    "hint": "HEAD 探测返回的直链，过滤网易云 VIP 占位 HTML 页（bugpk 对 VIP 歌会返回假链接）。关闭可省一次探测请求，但可能发出无法播放的卡片。",
+    "default": true
+  },
+  "retract_list_seconds": {
+    "description": "搜索结果自动撤回（秒）",
+    "type": "int",
+    "hint": "搜索结果列表发送 N 秒后自动撤回，0 = 不撤回。仅 aiocqhttp 平台生效。",
+    "default": 60
+  },
+  "react_emoji": {
+    "description": "命令表情回应",
+    "type": "string",
+    "hint": "收到点歌/解锁命令时在用户原消息上贴表情（NapCat/Lagrange，仅群聊可靠）。填表情 ID 或 Unicode 码点：128077=👍、49=强；留空关闭。",
+    "default": "128077"
+  },
+  "require_prefix": {
+    "description": "命令必须加 / 前缀",
+    "type": "bool",
+    "hint": "开启后必须发「/点歌 歌名」才触发；关闭后直接发「点歌 歌名」即可（带 / 也照常可用）。",
+    "default": false
+  },
+  "send_mode": {
+    "description": "歌曲发送模式",
+    "type": "string",
+    "options": ["card", "file", "voice", "text"],
+    "hint": "card=QQ音乐卡片（失败自动回退文本），file=音乐文件（按歌名命名，发完自动删本地文件），voice=语音，text=文本链接。可用「点歌模式」命令随时切换。",
+    "default": "card"
+  },
+  "delete_file_seconds": {
+    "description": "文件模式本地文件删除延迟（秒）",
+    "type": "int",
+    "hint": "文件模式发送完成后 N 秒删除本地文件以回收存储，0 = 保留。",
+    "default": 60
+  },
+  "auto_pick": {
+    "description": "自动点第一首",
+    "type": "bool",
+    "hint": "开启后「点歌 关键词」直接发送搜索结果第一首；关闭则列出结果回复序号选择",
+    "default": false
+  },
+  "limit": {
+    "description": "搜索结果数量",
+    "type": "int",
+    "default": 10
+  },
+  "timeout": {
+    "description": "API 请求超时时间（秒）",
+    "type": "float",
+    "hint": "搜索与解锁接口的请求超时。解锁服务需探测多个音源，过短容易超时",
+    "default": 15.0
+  }
+}
