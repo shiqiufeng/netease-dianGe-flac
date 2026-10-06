@@ -1,14 +1,16 @@
 # 网易云音乐点歌-flac
 
-AstrBot 网易云音乐点歌-flac 插件：搜索网易云音乐，配合你自部署的 [UnblockNeteaseMusic-utils](https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils) 解锁服务获取可播放直链，支持 QQ 音乐卡片 / 音乐文件 / 语音 / 文本链接四种发送方式。
+AstrBot 网易云音乐点歌-flac 插件：搜索网易云音乐，配合你自部署的 [UnblockNeteaseMusic-utils](https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils) 音源服务获取可播放直链，支持 QQ 音乐卡片 / 音乐文件 / 语音 / 文本链接四种发送方式。
 
-> 插件不含任何解锁服务器地址，`API 地址` 由使用者自行部署、自行填写，部署教程见下文。
+> ⚠️ 本插件仅供学习交流使用，请在体验后支持正版音乐。
+
+> 插件不含任何音源服务地址，`API 地址` 由使用者自行部署、自行填写，部署教程见下文。
 
 ## 功能
 
 - `点歌 <歌名>`：搜索网易云音乐，回复序号选歌（或配置为自动点第一首）
 - `点歌 <序号>`：直接选择上一次搜索结果的第 N 首
-- `解锁 <歌曲ID或分享链接>`：直接解锁指定歌曲，支持 `https://music.163.com/song?id=xxx` 格式的链接
+- `直链 <歌曲ID或分享链接>`：按歌曲 ID 或分享链接获取直链，支持 `https://music.163.com/song?id=xxx` 格式的链接
 - `点歌模式 [卡片|文件|文本]`：查看或切换发送方式（保存进配置，重启保留）
 - `帮助`：查看使用帮助与当前模式
 - **卡片模式**：QQ 音乐卡片，自定义卡片被拒时自动尝试网易云官方 163 卡片，再回退文本链接
@@ -18,7 +20,7 @@ AstrBot 网易云音乐点歌-flac 插件：搜索网易云音乐，配合你自
 - 收到命令时在用户消息上贴表情回应（👍 可自定义，NapCat/Lagrange 群聊有效）
 - 搜索结果列表发送 60 秒后自动撤回（可配置/关闭）
 - 免前缀触发：所有命令加不加唤醒前缀 `/` 都能用（可配置强制前缀）
-- 受限 / VIP 歌曲通过解锁服务获取直链；非 aiocqhttp 平台（如 Telegram）自动降级为文本 + 直链
+- 受限 / VIP 歌曲通过音源服务获取直链；非 aiocqhttp 平台（如 Telegram）自动降级为文本 + 直链
 
 ## 指令
 
@@ -30,7 +32,7 @@ AstrBot 网易云音乐点歌-flac 插件：搜索网易云音乐，配合你自
 | `点歌文件 <歌名>` | 本次以音乐文件发送（按歌名命名）         |
 | `点歌语音 <歌名>` | 本次以语音发送                  |
 | `点歌消息 <歌名>` | 本次以文本链接发送                |
-| `解锁 <ID/链接>` | 按歌曲 ID 或分享链接直接解锁           |
+| `直链 <ID/链接>` | 按歌曲 ID 或分享链接获取直链           |
 | `点歌模式 [卡片\|文件\|语音\|文本]` | 查看/切换默认发送方式，无参数显示当前模式 |
 | `帮助`         | 查看使用帮助、当前模式与作者信息           |
 
@@ -41,7 +43,7 @@ AstrBot 网易云音乐点歌-flac 插件：搜索网易云音乐，配合你自
 | 配置项          | 默认值                       | 说明                                                 |
 | ------------ | ------------------------- | -------------------------------------------------- |
 | `API 地址`（unlock_api） | 空 | 你部署的 UnblockNeteaseMusic-utils 地址，末尾不带 `/`。**项目地址：https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils ，部署教程见下文** |
-| `代理`（proxy）     | 空                         | 访问解锁服务走的代理，如 `http://127.0.0.1:7897`。仅解锁走代理，搜索仍直连 |
+| `代理`（proxy）     | 空                         | 访问音源服务走的代理，如 `http://127.0.0.1:7897`。仅音源请求走代理，搜索仍直连 |
 | `音源优先级`（source）     | `byfuns,ddyr,auto`         | 逗号分隔按顺序尝试。byfuns/ddyr 默认请求无损；`auto`=服务端自动（bugpk 兜底） |
 | `校验音频直链`（verify_audio） | `true`                   | HEAD 探测直链过滤 VIP 占位 HTML 假链接 |
 | `自动点第一首`（auto_pick）  | `false`                   | 开启后点歌直接发送第一首结果，不再列序号                               |
@@ -53,7 +55,7 @@ AstrBot 网易云音乐点歌-flac 插件：搜索网易云音乐，配合你自
 | `命令表情回应`（react_emoji） | `319`（比心）                    | 命令贴表情的 ID/Unicode 码点（319=比心、128077=👍、49=强），留空关闭 |
 | `命令必须加 / 前缀`（require_prefix） | `false`               | 开启 = 必须 `/点歌`；关闭 = 直接发 `点歌` |
 
-## 部署解锁服务教程
+## 部署音源服务教程
 
 插件需要一个 [UnblockNeteaseMusic-utils](https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils) 服务作为音源后端，任选一种方式部署：
 
@@ -89,13 +91,13 @@ curl "<你的API地址>/match?id=1498523311" # 应返回包含直链的 JSON
 
 1. 在本仓库 **Releases** 下载最新的附件（`网易云音乐点歌-flac`）；
 2. AstrBot WebUI → 插件管理 → 从文件安装，选择该 zip；
-3. 在插件配置里把 `API 地址` 填成你的解锁服务地址，重载插件即可使用。
+3. 在插件配置里把 `API 地址` 填成你的音源服务地址，重载插件即可使用。
 
 ## 常见问题
 
-- **提示"解锁失败"**：先在**运行 AstrBot 的机器**上确认解锁服务可达：`curl "<你的API地址>/inner/version"`，正常应返回版本 JSON。若本机网络对该域名 TLS 握手被重置（部分网络对非常见后缀域名有干扰），可在插件配置 `代理` 里填本机代理（如 Clash 的 `http://127.0.0.1:7897`），只有解锁请求走代理，搜索仍直连。
+- **提示"获取直链失败"**：先在**运行 AstrBot 的机器**上确认音源服务可达：`curl "<你的API地址>/inner/version"`，正常应返回版本 JSON。若本机网络对该域名 TLS 握手被重置（部分网络对非常见后缀域名有干扰），可在插件配置 `代理` 里填本机代理（如 Clash 的 `http://127.0.0.1:7897`），只有音源请求走代理，搜索仍直连。
 - **卡片能发出来但无法播放**：多为音源直链失效，可把 `音源优先级` 固定为其他音源试试。
-- **VIP 歌曲提示"解锁失败"**：当前各镜像音源没有 VIP 曲库。要解锁 VIP 歌需再部署 [NeteaseCloudMusicApi api-enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced) 并配置 VIP 账号 Cookie 的 `song/url/v1` 接口。
+- **VIP 歌曲获取直链失败**：当前各镜像音源没有 VIP 曲库。要获取 VIP 歌直链需再部署 [NeteaseCloudMusicApi api-enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced) 并配置 VIP 账号 Cookie 的 `song/url/v1` 接口。
 - **音乐卡片 / 表情回应仅 aiocqhttp 平台支持**（NapCat / Lagrange / go-cqhttp），卡片失败会自动回退；私聊贴表情在部分协议端不生效。
 
 ## 作者
@@ -107,6 +109,6 @@ curl "<你的API地址>/match?id=1498523311" # 应返回包含直链的 JSON
 
 ## 致谢
 
-- [UnblockNeteaseMusic-utils](https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils) — 音源匹配 / 解锁服务
+- [UnblockNeteaseMusic-utils](https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils) — 音源匹配服务
 - [astrbot\_plugin\_ncm\_directlink](https://github.com/monbed/astrbot_plugin_ncm_directlink) — 交互流程参考
 - [AstrBot](https://github.com/AstrBotDevs/AstrBot)

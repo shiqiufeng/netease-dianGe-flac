@@ -7,9 +7,9 @@
     "obvious_hint": true
   },
   "proxy": {
-    "description": "解锁请求代理",
+    "description": "音源请求代理",
     "type": "string",
-    "hint": "访问解锁服务走的 HTTP 代理，如 http://127.0.0.1:7897（Clash Verge 默认端口）。留空直连。仅解锁走代理，搜索仍直连。",
+    "hint": "访问音源服务走的 HTTP 代理，如 http://127.0.0.1:7897（Clash Verge 默认端口）。留空直连。仅音源请求走代理，搜索仍直连。",
     "default": ""
   },
   "source": {
@@ -33,7 +33,7 @@
   "react_emoji": {
     "description": "命令表情回应",
     "type": "string",
-    "hint": "收到点歌/解锁命令时在用户原消息上贴表情（NapCat/Lagrange，仅群聊可靠）。填表情 ID 或 Unicode 码点：319=比心、128077=👍、49=强；留空关闭。",
+    "hint": "收到点歌/直链命令时在用户原消息上贴表情（NapCat/Lagrange，仅群聊可靠）。填表情 ID 或 Unicode 码点：319=比心、128077=👍、49=强；留空关闭。",
     "default": "319"
   },
   "require_prefix": {
@@ -75,7 +75,7 @@
   "timeout": {
     "description": "API 请求超时时间（秒）",
     "type": "float",
-    "hint": "搜索与解锁接口的请求超时。解锁服务需探测多个音源，过短容易超时",
+    "hint": "搜索与音源接口的请求超时。音源服务需探测多个音源，过短容易超时",
     "default": 15.0
   }
 }

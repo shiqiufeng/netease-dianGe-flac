@@ -1,8 +1,8 @@
-"""AstrBot 网易云音乐点歌-flac 插件（UnblockNeteaseMusic 解锁版）。
+"""AstrBot 网易云音乐点歌-flac 插件（网易云直链版）。
 
 工作流程：
 1. 通过网易云音乐公开 Web 接口按关键词搜索歌曲；
-2. 选中歌曲后调用自部署的 UnblockNeteaseMusic-utils 服务（/match）解锁受限歌曲直链；
+2. 选中歌曲后调用自部署的 UnblockNeteaseMusic-utils 服务（/match）获取受限歌曲直链；
 3. aiocqhttp 平台（NapCat / Lagrange / go-cqhttp）发送 QQ 自定义音乐卡片，
    其他平台发送文本链接。
 """
@@ -91,7 +91,7 @@ class NeteaseCardMusic(Music):
 
 
 class NeteaseUnblockPlugin(Star):
-    """网易云音乐点歌-flac：网易云搜索 + UnblockNeteaseMusic 解锁。"""
+    """网易云音乐点歌-flac：网易云搜索 + 音源服务直链。"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -131,7 +131,7 @@ class NeteaseUnblockPlugin(Star):
         self._download_dir.mkdir(parents=True, exist_ok=True)
 
         self._pending: dict[str, dict] = {}
-        # 解锁服务单独走代理：本机网络可能对解锁域名 TLS 干扰（直连被重置），
+        # 音源服务单独走代理：本机网络可能对音源域名 TLS 干扰（直连被重置），
         # 而网易云搜索接口直连更快更稳，不跟着走代理。
         self._search_client = httpx.AsyncClient(
             timeout=self.timeout, follow_redirects=True, headers=HEADERS
@@ -144,7 +144,7 @@ class NeteaseUnblockPlugin(Star):
         )
 
         if not self.unlock_api:
-            logger.warning("[netease_unblock] 未配置解锁服务地址 unlock_api，解锁功能不可用。")
+            logger.warning("[netease_unblock] 未配置 API 地址 unlock_api，音源服务不可用。")
 
     async def terminate(self):
         """插件停用/重载时关闭共享的 httpx 客户端。"""
@@ -225,7 +225,7 @@ class NeteaseUnblockPlugin(Star):
         return self._normalize(songs[0]) if songs else None
 
     async def _match(self, song_id) -> str | None:
-        """调用自部署的 UnblockNeteaseMusic-utils 解锁服务，返回可播放直链。
+        """调用自部署的音源服务（UnblockNeteaseMusic-utils），返回可播放直链。
 
         source 支持逗号分隔的优先级列表（如 "byfuns,ddyr,auto"），逐个尝试；
         auto 表示交给服务端自动选择（含 bugpk 兜底）。byfuns/ddyr 默认请求
@@ -303,20 +303,20 @@ class NeteaseUnblockPlugin(Star):
             logger.warning(f"[netease_unblock] 表情回应失败: {e!r}")
 
     async def _resolve_results(self, event: AstrMessageEvent, song: dict, mode: str | None = None):
-        """解锁并构造发送结果（异步生成器）：按指定/默认模式发卡片 / 文件 / 语音 / 文本。"""
+        """获取直链并构造发送结果（异步生成器）：按指定/默认模式发卡片 / 文件 / 语音 / 文本。"""
         mode = mode or self.send_mode
         link = SONG_LINK.format(song["id"])
         try:
             audio = await self._match(song["id"])
         except Exception as e:
             hint = "（已配置代理，请确认代理进程存活）" if self.proxy else "（可尝试在插件配置里填写本机代理）"
-            logger.error(f"[netease_unblock] 解锁请求异常: {e!r} {hint}")
+            logger.error(f"[netease_unblock] 音源请求异常: {e!r} {hint}")
             audio = None
 
         if not audio:
             yield event.plain_result(
                 f"❌ {song['name']} - {song['artists'] or '未知歌手'}\n"
-                "解锁失败：解锁服务无可用音源或站点不可达\n"
+                "获取直链失败：音源服务无可用音源或站点不可达\n"
                 f"🔗 {link}"
             )
             return
@@ -616,7 +616,7 @@ class NeteaseUnblockPlugin(Star):
     async def _dian_ge_flow(self, event: AstrMessageEvent, kw: str, mode: str | None = None):
         if not kw:
             yield event.plain_result(
-                "用法：点歌 <歌名>（直接发「点歌 歌名」即可，无需前缀）\n也支持：解锁 <歌曲ID或分享链接>"
+                "用法：点歌 <歌名>（直接发「点歌 歌名」即可，无需前缀）\n也支持：直链 <歌曲ID或分享链接>"
             )
             return
 
@@ -663,9 +663,9 @@ class NeteaseUnblockPlugin(Star):
                 return
         yield event.plain_result(text)
 
-    @filter.command("解锁")
+    @filter.command("直链")
     async def unlock(self, event: AstrMessageEvent, target: GreedyStr):
-        """解锁 <网易云歌曲ID或分享链接>：直接解锁指定歌曲"""
+        """直链 <网易云歌曲ID或分享链接>：按 ID 或链接获取歌曲直链"""
         async for r in self._unlock_flow(event, str(target or "").strip()):
             yield r
 
@@ -673,7 +673,7 @@ class NeteaseUnblockPlugin(Star):
         m = _ID_FROM_URL.search(text)
         song_id = m.group(1) if m else (text if text.isdigit() else "")
         if not song_id:
-            yield event.plain_result("用法：解锁 <歌曲ID 或 歌曲分享链接>（直接发「解锁 ID」即可）")
+            yield event.plain_result("用法：直链 <歌曲ID 或 歌曲分享链接>（直接发「直链 ID」即可）")
             return
 
         await self._react(event)
@@ -772,7 +772,7 @@ class NeteaseUnblockPlugin(Star):
             "点歌文件 <歌名>　以音乐文件发送\n"
             "点歌语音 <歌名>　以语音发送\n"
             "点歌消息 <歌名>　以文本链接发送\n"
-            "解锁 <ID/链接>　按 ID 或分享链接解锁\n"
+            "直链 <ID/链接>　按 ID 或分享链接获取直链\n"
             "点歌模式 [模式]　查看/切换默认发送方式\n"
             "帮助　　　　　　查看本帮助\n"
             "══════════════════\n"
@@ -780,7 +780,7 @@ class NeteaseUnblockPlugin(Star):
             "点歌 咏春\n"
             "点歌文件 咏春\n"
             "点歌语音 咏春\n"
-            "解锁 1498523311\n"
+            "直链 1498523311\n"
             "点歌模式 文件\n"
             "══════════════════\n"
             f"⚙️ 默认发送：{SEND_MODE_CN.get(mode, mode)}"
@@ -794,7 +794,7 @@ class NeteaseUnblockPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_prefix_free(self, event: AstrMessageEvent):
-        """免唤醒前缀触发：直接发「点歌 xx」「解锁 xx」「点歌模式 xx」「帮助」即可使用。
+        """免唤醒前缀触发：直接发「点歌 xx」「直链 xx」「点歌模式 xx」「帮助」即可使用。
 
         带前缀的消息（如 /点歌）仍由 AstrBot 命令系统处理，不会重复响应。
         配置「命令必须加 / 前缀」开启后本分发器停用。
@@ -823,8 +823,8 @@ class NeteaseUnblockPlugin(Star):
         elif text.startswith("点歌"):
             async for r in self._dian_ge_flow(event, text[len("点歌"):].strip()):
                 yield r
-        elif text.startswith("解锁"):
-            async for r in self._unlock_flow(event, text[len("解锁"):].strip()):
+        elif text.startswith("直链"):
+            async for r in self._unlock_flow(event, text[len("直链"):].strip()):
                 yield r
         elif text == "帮助":
             async for r in self._help_flow(event):
