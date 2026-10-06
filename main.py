@@ -17,6 +17,11 @@ from urllib.parse import urlparse
 
 import httpx
 
+try:
+    import mutagen  # 歌词/标签内嵌用，缺失时自动跳过内嵌
+except ImportError:
+    mutagen = None
+
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import File, Music, Plain, Record
@@ -39,6 +44,7 @@ SEND_MODE_CN = {"card": "卡片", "file": "文件", "text": "文本", "voice": "
 
 SEARCH_API = "https://music.163.com/api/search/get/web"
 SONG_DETAIL_API = "https://music.163.com/api/song/detail"
+LYRIC_API = "https://music.163.com/api/song/lyric"
 SONG_LINK = "https://music.163.com/#/song?id={}"
 HEADERS = {
     "User-Agent": (
@@ -106,6 +112,8 @@ class NeteaseUnblockPlugin(Star):
             self.retract_seconds = 60
         self.react_emoji = str(config.get("react_emoji") or "").strip()
         self.require_prefix = bool(config.get("require_prefix") or False)
+        _el = config.get("embed_lyrics")
+        self.embed_lyrics = True if _el is None else bool(_el)
         self.send_mode = (str(config.get("send_mode") or "card")).strip().lower()
         if self.send_mode not in ("card", "file", "text"):
             self.send_mode = "card"
@@ -353,7 +361,7 @@ class NeteaseUnblockPlugin(Star):
         yield event.plain_result(text)
 
     async def _send_file(self, event: AstrMessageEvent, song: dict, audio: str):
-        """下载音乐并以文件形式发送，发送后定时删除本地文件。"""
+        """下载音乐并以文件形式发送，内嵌歌词后定时删除本地文件。"""
         yield event.plain_result(f"⏳ 正在下载「{song['name']}」，请稍候…")
         try:
             path = await self._download_song(song, audio)
@@ -361,6 +369,12 @@ class NeteaseUnblockPlugin(Star):
             logger.error(f"[netease_unblock] 文件下载失败: {e!r}")
             yield event.plain_result(f"❌ 文件下载失败：{e!r}\n▶️ 直链：{audio}")
             return
+        if self.embed_lyrics:
+            lrc = await self._fetch_lyrics(song["id"])
+            if lrc:
+                ok = await asyncio.to_thread(self._embed_lyrics, path, song, lrc)
+                if ok:
+                    logger.info(f"[netease_unblock] 已内嵌歌词: {path.name}")
         try:
             yield event.chain_result([File(name=path.name, file=str(path))])
         except Exception as e:
@@ -369,6 +383,64 @@ class NeteaseUnblockPlugin(Star):
         finally:
             if self.delete_file_seconds > 0:
                 asyncio.create_task(self._delete_later(path, self.delete_file_seconds))
+
+    async def _fetch_lyrics(self, song_id) -> str | None:
+        """抓取网易云 LRC 歌词，无歌词返回 None。"""
+        try:
+            resp = await self._search_client.get(LYRIC_API, params={"id": str(song_id), "lv": 1})
+            resp.raise_for_status()
+            lrc = ((resp.json() or {}).get("lrc") or {}).get("lyric")
+        except Exception as e:
+            logger.warning(f"[netease_unblock] 歌词获取失败: {e!r}")
+            return None
+        return lrc.strip() or None
+
+    def _embed_lyrics(self, path: Path, song: dict, lrc: str) -> bool:
+        """把 LRC 歌词与标题/歌手/专辑标签写入音频文件（同步阻塞，调用方放线程里跑）。"""
+        if mutagen is None:
+            logger.warning("[netease_unblock] 未安装 mutagen，跳过歌词内嵌")
+            return False
+        title = song.get("name") or ""
+        artist = song.get("artists") or ""
+        album = song.get("album") or ""
+        try:
+            from mutagen.flac import FLAC
+            from mutagen.id3 import ID3, ID3NoHeaderError, TALB, TIT2, TPE1, USLT
+            from mutagen.mp4 import MP4
+
+            suffix = path.suffix.lower()
+            if suffix == ".flac":
+                f = FLAC(str(path))
+                f["LYRICS"] = lrc
+                f["title"] = title
+                f["artist"] = artist
+                f["album"] = album
+                f.save()
+                return True
+            if suffix == ".mp3":
+                try:
+                    tags = ID3(str(path))
+                except ID3NoHeaderError:
+                    tags = ID3()
+                tags.setall("USLT", [USLT(encoding=3, lang="chi", desc="歌词", text=lrc)])
+                tags.add(TIT2(encoding=3, text=title))
+                tags.add(TPE1(encoding=3, text=artist))
+                tags.add(TALB(encoding=3, text=album))
+                tags.save(str(path), v2_version=3)
+                return True
+            if suffix in (".m4a", ".mp4"):
+                f = MP4(str(path))
+                f["\xa9lyr"] = [lrc]
+                f["\xa9nam"] = [title]
+                f["\xa9ART"] = [artist]
+                f["\xa9alb"] = [album]
+                f.save()
+                return True
+            logger.info(f"[netease_unblock] 格式 {suffix} 暂不支持内嵌歌词，跳过")
+            return False
+        except Exception as e:
+            logger.warning(f"[netease_unblock] 歌词内嵌失败: {e!r}")
+            return False
 
     async def _send_voice(self, event: AstrMessageEvent, song: dict, audio: str):
         """下载并以语音（Record）形式发送，发送完成立即清理临时文件。"""
@@ -647,6 +719,13 @@ class NeteaseUnblockPlugin(Star):
             "解锁 <ID/链接>　按 ID 或分享链接解锁\n"
             "点歌模式 [模式]　查看/切换默认发送方式\n"
             "帮助　　　　　　查看本帮助\n"
+            "══════════════════\n"
+            "💡 示例\n"
+            "点歌 咏春\n"
+            "点歌文件 咏春\n"
+            "点歌语音 咏春\n"
+            "解锁 1498523311\n"
+            "点歌模式 文件\n"
             "══════════════════\n"
             f"⚙️ 默认发送：{SEND_MODE_CN.get(mode, mode)}"
             + ("（卡片被拒自动回退）\n" if mode == "card" else "\n")

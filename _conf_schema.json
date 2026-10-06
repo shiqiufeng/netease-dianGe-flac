@@ -55,6 +55,12 @@
     "hint": "文件模式发送完成后 N 秒删除本地文件以回收存储，0 = 保留。",
     "default": 60
   },
+  "embed_lyrics": {
+    "description": "文件内嵌歌词",
+    "type": "bool",
+    "hint": "文件模式下载后把 LRC 歌词和歌名/歌手/专辑标签写入音频文件（FLAC/MP3/M4A）。",
+    "default": true
+  },
   "auto_pick": {
     "description": "自动点第一首",
     "type": "bool",

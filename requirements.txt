@@ -1,1 +1,2 @@
 httpx>=0.27
+mutagen>=1.47
