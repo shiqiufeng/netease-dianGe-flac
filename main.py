@@ -9,6 +9,7 @@
 
 import asyncio
 import os
+import random
 import re
 import time
 import uuid
@@ -45,6 +46,12 @@ SEND_MODE_CN = {"card": "卡片", "file": "文件", "text": "文本", "voice": "
 SEARCH_API = "https://music.163.com/api/search/get/web"
 SONG_DETAIL_API = "https://music.163.com/api/song/detail"
 LYRIC_API = "https://music.163.com/api/song/lyric"
+TOP_LIST_API = "https://music.163.com/api/toplist"
+PLAYLIST_DETAIL_API = "https://music.163.com/api/playlist/detail"
+COMMENTS_API = "https://music.163.com/api/v1/resource/comments/R_SO_4_{sid}"
+NEW_SONGS_API = "https://music.163.com/api/discovery/new/songs"
+RADIO_API = "https://music.163.com/api/v1/radio/get"
+NEW_SONG_AREAS = {"全部": 0, "华语": 7, "欧美": 96, "日本": 8, "韩国": 16}
 SONG_LINK = "https://music.163.com/#/song?id={}"
 HEADERS = {
     "User-Agent": (
@@ -605,6 +612,253 @@ class NeteaseUnblockPlugin(Star):
             logger.warning(f"[netease_unblock] 自动撤回失败: {e!r}")
 
     # ------------------------------------------------------------------ #
+    # 发现音乐（公开接口）
+    # ------------------------------------------------------------------ #
+    async def _api_get(self, path: str, params: dict | None = None) -> dict | None:
+        """请求网易云公开接口，失败返回 None。"""
+        try:
+            resp = await self._search_client.get(path, params=params or {})
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.warning(f"[netease_unblock] 接口 {path} 请求失败: {e!r}")
+            return None
+
+    async def _search_type(self, keyword: str, ntype: int, limit: int = 3) -> list[dict]:
+        """按类型搜索：100 歌手 / 10 专辑 / 1000 歌单。"""
+        resp = await self._search_client.get(
+            SEARCH_API,
+            params={"s": keyword, "type": ntype, "offset": 0, "limit": limit, "total": "true"},
+        )
+        resp.raise_for_status()
+        result = (resp.json() or {}).get("result") or {}
+        if ntype == 100:
+            return result.get("artists") or []
+        if ntype == 10:
+            return result.get("albums") or []
+        if ntype == 1000:
+            return result.get("playlists") or []
+        return result.get("songs") or []
+
+    async def _resolve_song_id(self, text: str) -> int | None:
+        """「关键词|ID」或纯数字 → 歌曲ID；否则按关键词搜索取第一首。"""
+        text = text.strip()
+        if "|" in text:
+            text = text.split("|")[-1].strip()
+        if text.isdigit():
+            return int(text)
+        try:
+            songs = await self._search(text)
+        except Exception:
+            return None
+        return songs[0]["id"] if songs else None
+
+    async def _lyrics_flow(self, event: AstrMessageEvent, text: str):
+        if not text:
+            yield event.plain_result("用法：歌词 <歌名|ID>（如：歌词 晴天 或 歌词 晴天|186016）")
+            return
+        sid = await self._resolve_song_id(text)
+        if not sid:
+            yield event.plain_result(f"❌ 未找到「{text}」对应的歌曲")
+            return
+        lrc = await self._fetch_lyrics(sid)
+        if not lrc:
+            yield event.plain_result("❌ 该歌曲暂无歌词（或为纯音乐）")
+            return
+        lines = lrc.splitlines()
+        if len(lines) > 80:
+            lines = lines[:80] + ["……（歌词过长已截断）"]
+        yield event.plain_result("🎤 歌词：\n" + "\n".join(lines))
+
+    async def _toplist_flow(self, event: AstrMessageEvent, arg: str):
+        data = await self._api_get(TOP_LIST_API)
+        boards = (data or {}).get("list") or []
+        if not boards:
+            yield event.plain_result("❌ 排行榜获取失败")
+            return
+        if not arg:
+            lines = ["🏆 官方排行榜（回复「排行 榜单名」查看曲目）："]
+            for i, b in enumerate(boards[:15], 1):
+                lines.append(f"{i}. {b.get('name')}（{b.get('updateFrequency') or ''}）")
+            yield event.plain_result("\n".join(lines))
+            return
+        target = next(
+            (b for b in boards if arg in (b.get("name") or "") or (b.get("name") or "") in arg),
+            None,
+        )
+        if not target:
+            yield event.plain_result(f"❌ 未找到榜单「{arg}」，回复「排行」查看全部榜单")
+            return
+        detail = await self._api_get(PLAYLIST_DETAIL_API, {"id": target.get("id")})
+        tracks = ((detail or {}).get("result") or {}).get("tracks") or []
+        if not tracks:
+            yield event.plain_result("❌ 榜单曲目获取失败")
+            return
+        lines = [f"🏆 {target.get('name')}（{target.get('updateFrequency') or ''}）"]
+        for i, s in enumerate(tracks[:10], 1):
+            lines.append(f"{i}. {self._fmt(self._normalize(s))}")
+        lines.append("想听哪首：点歌 歌名")
+        yield event.plain_result("\n".join(lines))
+
+    async def _artist_flow(self, event: AstrMessageEvent, kw: str):
+        if not kw:
+            yield event.plain_result("用法：歌手 <名字>（如：歌手 周杰伦）")
+            return
+        try:
+            artists = await self._search_type(kw, 100, 3)
+        except Exception as e:
+            logger.warning(f"[netease_unblock] 歌手搜索失败: {e!r}")
+            artists = []
+        target = next((a for a in artists if a.get("name") == kw), artists[0] if artists else None)
+        if not target:
+            yield event.plain_result(f"❌ 未找到歌手「{kw}」")
+            return
+        detail = await self._api_get(f"https://music.163.com/api/artist/{target.get('id')}")
+        hot = (detail or {}).get("hotSongs") or []
+        if not hot:
+            yield event.plain_result("❌ 热门歌曲获取失败")
+            return
+        lines = [f"🎤 {target.get('name')} 的热门歌曲"]
+        for i, s in enumerate(hot[:10], 1):
+            lines.append(f"{i}. {self._fmt(self._normalize(s))}")
+        lines.append("想听哪首：点歌 歌名")
+        yield event.plain_result("\n".join(lines))
+
+    async def _album_flow(self, event: AstrMessageEvent, kw: str):
+        if not kw:
+            yield event.plain_result("用法：专辑 <名字>（如：专辑 叶惠美）")
+            return
+        try:
+            albums = await self._search_type(kw, 10, 3)
+        except Exception as e:
+            logger.warning(f"[netease_unblock] 专辑搜索失败: {e!r}")
+            albums = []
+        target = next((a for a in albums if a.get("name") == kw), albums[0] if albums else None)
+        if not target:
+            yield event.plain_result(f"❌ 未找到专辑「{kw}」")
+            return
+        detail = await self._api_get(f"https://music.163.com/api/album/{target.get('id')}")
+        songs = (detail or {}).get("songs") or ((detail or {}).get("album") or {}).get("songs") or []
+        if not songs:
+            yield event.plain_result("❌ 专辑曲目获取失败")
+            return
+        artist_name = ((target.get("artist") or {}).get("name")) or (
+            ((detail or {}).get("album") or {}).get("artist") or {}
+        ).get("name") or ""
+        lines = [f"💿 专辑《{target.get('name')}》- {artist_name}（共 {len(songs)} 首）"]
+        for i, s in enumerate(songs[:10], 1):
+            song = self._normalize(s)
+            if not song.get("album"):
+                song["album"] = target.get("name") or ""
+            lines.append(f"{i}. {self._fmt(song)}")
+        lines.append("想听哪首：点歌 歌名")
+        yield event.plain_result("\n".join(lines))
+
+    async def _playlist_flow(self, event: AstrMessageEvent, kw: str):
+        if not kw:
+            yield event.plain_result("用法：歌单 <关键词>（如：歌单 华语）")
+            return
+        try:
+            playlists = await self._search_type(kw, 1000, 3)
+        except Exception as e:
+            logger.warning(f"[netease_unblock] 歌单搜索失败: {e!r}")
+            playlists = []
+        target = playlists[0] if playlists else None
+        if not target:
+            yield event.plain_result(f"❌ 未找到歌单「{kw}」")
+            return
+        detail = await self._api_get(PLAYLIST_DETAIL_API, {"id": target.get("id")})
+        tracks = ((detail or {}).get("result") or {}).get("tracks") or []
+        if not tracks:
+            yield event.plain_result("❌ 歌单曲目获取失败")
+            return
+        play = target.get("playCount")
+        play = f"{play} 次播放" if play else "热门歌单"
+        lines = [f"📋 歌单《{target.get('name')}》（{play}）"]
+        for i, s in enumerate(tracks[:10], 1):
+            lines.append(f"{i}. {self._fmt(self._normalize(s))}")
+        lines.append("想听哪首：点歌 歌名")
+        yield event.plain_result("\n".join(lines))
+
+    async def _comments_flow(self, event: AstrMessageEvent, text: str):
+        if not text:
+            yield event.plain_result("用法：评论 <歌名|ID>（如：评论 晴天 或 评论 186016）")
+            return
+        sid = await self._resolve_song_id(text)
+        if not sid:
+            yield event.plain_result(f"❌ 未找到「{text}」对应的歌曲")
+            return
+        data = await self._api_get(COMMENTS_API.format(sid=sid), {"limit": 5})
+        hot = (data or {}).get("hotComments") or []
+        if not hot:
+            yield event.plain_result("❌ 该歌曲暂无热评")
+            return
+        total = (data or {}).get("total")
+        lines = [f"💬 热评（共 {total} 条）：" if total else "💬 热评："]
+        for i, c in enumerate(hot[:5], 1):
+            user = ((c.get("user") or {}).get("nickname")) or "匿名"
+            content = (c.get("content") or "").strip().replace("\n", " ")
+            if len(content) > 90:
+                content = content[:90] + "……"
+            lines.append(f"{i}. {user}：{content}（赞 {c.get('likedCount', 0)}）")
+        yield event.plain_result("\n".join(lines))
+
+    async def _new_songs_flow(self, event: AstrMessageEvent, arg: str):
+        area = (arg or "华语").strip()
+        area_id = NEW_SONG_AREAS.get(area)
+        if area_id is None:
+            yield event.plain_result("可选地区：全部 / 华语 / 欧美 / 日本 / 韩国（如：新歌 欧美）")
+            return
+        data = await self._api_get(NEW_SONGS_API, {"areaId": area_id})
+        songs = (data or {}).get("data") or []
+        if not songs:
+            yield event.plain_result("❌ 新歌速递获取失败")
+            return
+        lines = [f"🆕 {area}新歌速递："]
+        for i, s in enumerate(songs[:10], 1):
+            lines.append(f"{i}. {self._fmt(self._normalize(s))}")
+        lines.append("想听哪首：点歌 歌名")
+        yield event.plain_result("\n".join(lines))
+
+    async def _random_flow(self, event: AstrMessageEvent):
+        data = await self._api_get(RADIO_API)
+        songs = (data or {}).get("data") or []
+        if not songs:
+            yield event.plain_result("❌ 随机歌曲获取失败，请稍后重试")
+            return
+        song = self._normalize(random.choice(songs))
+        await self._react(event)
+        async for r in self._resolve_results(event, song):
+            yield r
+
+    async def _serial_flow(self, event: AstrMessageEvent, arg: str):
+        """连播当前点歌列表：按语音顺序发送，最多 10 首（防刷屏）。"""
+        key = self._cache_key(event)
+        pending = self._pending.get(key)
+        if not pending or pending.get("stage") != "pick_song" or not pending.get("songs"):
+            yield event.plain_result("❌ 没有待连播的列表，先「点歌 关键词」搜索一次再用连播")
+            return
+        try:
+            n = int(arg) if arg else 5
+        except (TypeError, ValueError):
+            n = 5
+        n = max(1, min(n, 10))
+        songs = pending["songs"][:n]
+        self._pending.pop(key, None)
+        await self._react(event)
+        ok = 0
+        for i, song in enumerate(songs, 1):
+            yield event.plain_result(f"▶️ 连播 {i}/{len(songs)}：{song['name']} - {song['artists'] or '未知歌手'}")
+            try:
+                async for r in self._resolve_results(event, song, mode="voice"):
+                    yield r
+                ok += 1
+            except Exception as e:
+                logger.warning(f"[netease_unblock] 连播第 {i} 首失败: {e!r}")
+            await asyncio.sleep(2)
+        yield event.plain_result(f"✅ 连播结束（成功 {ok}/{len(songs)}）")
+
+    # ------------------------------------------------------------------ #
     # 指令与序号分发
     # ------------------------------------------------------------------ #
     @filter.command("点歌")
@@ -763,7 +1017,7 @@ class NeteaseUnblockPlugin(Star):
     async def _help_flow(self, event: AstrMessageEvent):
         mode = self.send_mode
         tips = (
-            "🎵 网易云音乐点歌-flac\n"
+            "🎵 网易云音乐点歌-flac v2.0\n"
             "══════════════════\n"
             "📖 命令（加不加 / 前缀均可）\n"
             "点歌 <歌名>　　　搜索歌曲，回复序号选择\n"
@@ -776,12 +1030,27 @@ class NeteaseUnblockPlugin(Star):
             "点歌模式 [模式]　查看/切换默认发送方式\n"
             "帮助　　　　　　查看本帮助\n"
             "══════════════════\n"
+            "🌐 发现音乐\n"
+            "歌词 <歌名|ID>　查看歌词\n"
+            "排行 [榜单名]　官方排行榜\n"
+            "歌手 <名字>　　热门歌曲\n"
+            "专辑 <名字>　　专辑曲目\n"
+            "歌单 <关键词>　歌单曲目\n"
+            "评论 <歌名|ID>　歌曲热评\n"
+            "新歌 [地区]　　新歌速递(华语/欧美/日本/韩国)\n"
+            "来首歌　　　　　随机来一首\n"
+            "连播 [数量]　　连播当前列表(语音,≤10)\n"
+            "══════════════════\n"
             "💡 示例\n"
             "点歌 咏春\n"
             "点歌文件 咏春\n"
             "点歌语音 咏春\n"
             "直链 1498523311\n"
             "点歌模式 文件\n"
+            "歌词 晴天\n"
+            "排行\n"
+            "歌手 周杰伦\n"
+            "评论 晴天\n"
             "══════════════════\n"
             f"⚙️ 默认发送：{SEND_MODE_CN.get(mode, mode)}"
             + ("（卡片被拒自动回退）\n" if mode == "card" else "\n")
@@ -791,6 +1060,60 @@ class NeteaseUnblockPlugin(Star):
             "流水 · 听雨的蛙 · 落雪 · GLM-5.3-Flash"
         )
         yield event.plain_result(tips)
+
+    @filter.command("歌词")
+    async def lyrics_cmd(self, event: AstrMessageEvent, keyword: GreedyStr):
+        """歌词 <歌名|ID>：获取网易云歌词"""
+        async for r in self._lyrics_flow(event, str(keyword or "").strip()):
+            yield r
+
+    @filter.command("排行")
+    async def toplist_cmd(self, event: AstrMessageEvent, keyword: GreedyStr):
+        """排行 [榜单名]：官方排行榜列表或曲目"""
+        async for r in self._toplist_flow(event, str(keyword or "").strip()):
+            yield r
+
+    @filter.command("歌手")
+    async def artist_cmd(self, event: AstrMessageEvent, keyword: GreedyStr):
+        """歌手 <名字>：歌手热门歌曲"""
+        async for r in self._artist_flow(event, str(keyword or "").strip()):
+            yield r
+
+    @filter.command("专辑")
+    async def album_cmd(self, event: AstrMessageEvent, keyword: GreedyStr):
+        """专辑 <名字>：专辑曲目"""
+        async for r in self._album_flow(event, str(keyword or "").strip()):
+            yield r
+
+    @filter.command("歌单")
+    async def playlist_cmd(self, event: AstrMessageEvent, keyword: GreedyStr):
+        """歌单 <关键词>：歌单曲目"""
+        async for r in self._playlist_flow(event, str(keyword or "").strip()):
+            yield r
+
+    @filter.command("评论")
+    async def comments_cmd(self, event: AstrMessageEvent, keyword: GreedyStr):
+        """评论 <歌名|ID>：歌曲热评"""
+        async for r in self._comments_flow(event, str(keyword or "").strip()):
+            yield r
+
+    @filter.command("新歌")
+    async def new_songs_cmd(self, event: AstrMessageEvent, keyword: GreedyStr):
+        """新歌 [地区]：新歌速递（华语/欧美/日本/韩国）"""
+        async for r in self._new_songs_flow(event, str(keyword or "").strip()):
+            yield r
+
+    @filter.command("来首歌")
+    async def random_cmd(self, event: AstrMessageEvent):
+        """来首歌：随机来一首"""
+        async for r in self._random_flow(event):
+            yield r
+
+    @filter.command("连播")
+    async def serial_cmd(self, event: AstrMessageEvent, keyword: GreedyStr):
+        """连播 [数量]：连播当前点歌列表（语音，最多 10 首）"""
+        async for r in self._serial_flow(event, str(keyword or "").strip()):
+            yield r
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_prefix_free(self, event: AstrMessageEvent):
@@ -825,6 +1148,33 @@ class NeteaseUnblockPlugin(Star):
                 yield r
         elif text.startswith("直链"):
             async for r in self._unlock_flow(event, text[len("直链"):].strip()):
+                yield r
+        elif text.startswith("歌词"):
+            async for r in self._lyrics_flow(event, text[len("歌词"):].strip()):
+                yield r
+        elif text.startswith("排行"):
+            async for r in self._toplist_flow(event, text[len("排行"):].strip()):
+                yield r
+        elif text.startswith("歌手"):
+            async for r in self._artist_flow(event, text[len("歌手"):].strip()):
+                yield r
+        elif text.startswith("专辑"):
+            async for r in self._album_flow(event, text[len("专辑"):].strip()):
+                yield r
+        elif text.startswith("歌单"):
+            async for r in self._playlist_flow(event, text[len("歌单"):].strip()):
+                yield r
+        elif text.startswith("评论"):
+            async for r in self._comments_flow(event, text[len("评论"):].strip()):
+                yield r
+        elif text.startswith("新歌"):
+            async for r in self._new_songs_flow(event, text[len("新歌"):].strip()):
+                yield r
+        elif text == "来首歌":
+            async for r in self._random_flow(event):
+                yield r
+        elif text.startswith("连播"):
+            async for r in self._serial_flow(event, text[len("连播"):].strip()):
                 yield r
         elif text == "帮助":
             async for r in self._help_flow(event):

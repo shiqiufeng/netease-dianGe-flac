@@ -1,6 +1,6 @@
 name: astrbot_plugin_netease_unblock
 display_name: 网易云音乐点歌-flac
 desc: 网易云音乐点歌-flac 插件：搜索网易云音乐，配合自部署 UnblockNeteaseMusic-utils 获取受限歌曲直链，支持卡片/文件/语音/文本四种发送方式。
-version: v1.7.0
+version: v2.0.0
 author: "流水, 听雨的蛙, 落雪, GLM-5.3-Flash"
 repo: https://github.com/shiqiufeng/netease-dianGe-flac
