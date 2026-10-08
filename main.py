@@ -455,7 +455,11 @@ class NeteaseUnblockPlugin(Star):
                 continue
             covers.add(song["id"])
             # 标注的原唱必须与本次搜索同名，否则可能是张冠李戴的转辑版本
-            if oid in known or oid in orig_ids or self._base_title(origin.get("name") or "") != target:
+            if oid in orig_ids or self._base_title(origin.get("name") or "") != target:
+                continue
+            if oid in known:
+                # 原唱本来就在结果里：不用再拉一次详情，标记出来排到最前即可
+                orig_ids.add(oid)
                 continue
             original = await self._get_song_detail(oid)
             if original is None or self._base_title(original["name"]) != target:
@@ -491,13 +495,45 @@ class NeteaseUnblockPlugin(Star):
         if not deep_list:
             return rest, top_id in covers
 
-        # 判据一：评论数。原唱通常比翻唱高几个数量级，这个最准。
-        popular = await self._pick_most_popular([top] + deep_list if top else deep_list, top)
-        if popular:
-            return [popular] + [s for s in rest if s["id"] != popular["id"]], False
+        # 深扫候选里同样混着翻唱，而且**有的翻唱评论数比原唱还高**，会被下面的
+        # 「评论数判据」误当成原唱推上来（实测「伯虎说」：翻唱「玉狐若児/十三」
+        # 评论数压过原唱「伯爵Johnny/唐伯虎Annie」，结果点歌发出去的成了翻唱）。
+        # 所以先用详情里的 originCoverType 把网易云自己标注的翻唱/改编剔掉，
+        # 并顺手收集它在 originSongSimpleData 里给出的原唱 songId。
+        deep_details = await self._get_details([s["id"] for s in deep_list])
+        clean: list = []
+        declared: list = []
+        for s in deep_list:
+            detail = deep_details.get(s["id"]) or {}
+            # 先取它标注的原唱：翻唱自己就带着正确答案（originSongSimpleData.songId）
+            origin = detail.get("originSongSimpleData") or {}
+            oid = origin.get("songId")
+            if oid and self._base_title(origin.get("name") or "") == target:
+                declared.append(str(oid))
+            if detail.get("originCoverType") in (2, 3):
+                continue  # 网易云标注的翻唱/改编，没资格当原唱
+            clean.append(s)
+
+        # 网易云明确标注出的原唱最可信：找到就直接排最前（已在列表里就用现成的）。
+        for oid in declared:
+            here = next((s for s in rest if s["id"] == oid), None)
+            if here is not None:
+                return [here] + [s for s in rest if s["id"] != oid], False
+            original = await self._get_song_detail(oid)
+            if original is not None and self._base_title(original["name"]) == target:
+                return [original] + [s for s in rest if s["id"] != original["id"]], False
+
+        if not clean:
+            return rest, top_id in covers
+
+        # 判据一：评论数。原唱通常比翻唱高几个数量级，这个最准（只在没被标成翻唱的候选里比）。
+        if top is not None and top["id"] not in covers:
+            popular = await self._pick_most_popular([top] + clean, top)
+            if popular:
+                return [popular] + [s for s in rest if s["id"] != popular["id"]], False
 
         # 判据二：发行时间。评论数持平（或拿不到）时，用「更早发行的同名版本」兜底。
-        deep = deep_list[0]
+        deep = clean[0]
         if top is None or (deep.get("publish") or 0) < (top.get("publish") or 0):
             return [deep] + [s for s in rest if s["id"] != deep["id"]], False
         return rest, top_id in covers
@@ -1728,7 +1764,7 @@ class NeteaseUnblockPlugin(Star):
         await self._react(event)  # 命令回执
         mode = self.send_mode
         tips = (
-            "🎵 网易云音乐点歌-flac v2.5\n"
+            "🎵 网易云音乐点歌-flac v2.5.1\n"
             "══════════════════\n"
             "📖 命令（加不加 / 前缀均可）\n"
             "点歌 <歌名>　　　搜索歌曲，回复序号选择\n"
