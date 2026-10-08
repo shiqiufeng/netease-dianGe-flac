@@ -1288,6 +1288,7 @@ class NeteaseUnblockPlugin(Star):
         }
 
     async def _lyrics_flow(self, event: AstrMessageEvent, text: str):
+        await self._react(event)  # 命令回执
         if not text:
             r = await self._say(event, "用法：歌词 <歌名|ID>（如：歌词 晴天 或 歌词 晴天|186016）")
             if r is not None:
@@ -1313,6 +1314,7 @@ class NeteaseUnblockPlugin(Star):
             yield r
 
     async def _toplist_flow(self, event: AstrMessageEvent, arg: str):
+        await self._react(event)  # 命令回执
         data = await self._api_get(TOP_LIST_API)
         boards = (data or {}).get("list") or []
         if not boards:
@@ -1361,6 +1363,7 @@ class NeteaseUnblockPlugin(Star):
             yield r
 
     async def _artist_flow(self, event: AstrMessageEvent, kw: str):
+        await self._react(event)  # 命令回执
         if not kw:
             r = await self._say(event, "用法：歌手 <名字>（如：歌手 周杰伦）")
             if r is not None:
@@ -1395,6 +1398,7 @@ class NeteaseUnblockPlugin(Star):
             yield r
 
     async def _album_flow(self, event: AstrMessageEvent, kw: str):
+        await self._react(event)  # 命令回执
         if not kw:
             r = await self._say(event, "用法：专辑 <名字>（如：专辑 叶惠美）")
             if r is not None:
@@ -1437,6 +1441,7 @@ class NeteaseUnblockPlugin(Star):
             yield r
 
     async def _playlist_flow(self, event: AstrMessageEvent, kw: str):
+        await self._react(event)  # 命令回执
         if not kw:
             r = await self._say(event, "用法：歌单 <关键词>（如：歌单 华语）")
             if r is not None:
@@ -1473,6 +1478,7 @@ class NeteaseUnblockPlugin(Star):
             yield r
 
     async def _comments_flow(self, event: AstrMessageEvent, text: str):
+        await self._react(event)  # 命令回执
         if not text:
             r = await self._say(event, "用法：评论 <歌名|ID>（如：评论 晴天 或 评论 186016）")
             if r is not None:
@@ -1504,6 +1510,7 @@ class NeteaseUnblockPlugin(Star):
             yield r
 
     async def _new_songs_flow(self, event: AstrMessageEvent, arg: str):
+        await self._react(event)  # 命令回执
         area = (arg or "华语").strip()
         area_id = NEW_SONG_AREAS.get(area)
         if area_id is None:
@@ -1529,6 +1536,7 @@ class NeteaseUnblockPlugin(Star):
             yield r
 
     async def _random_flow(self, event: AstrMessageEvent):
+        await self._react(event)  # 命令回执
         data = await self._api_get(RADIO_API)
         songs = (data or {}).get("data") or []
         if not songs:
@@ -1537,7 +1545,6 @@ class NeteaseUnblockPlugin(Star):
                 yield r
             return
         song = self._normalize(random.choice(songs))
-        await self._react(event)
         async for r in self._resolve_results(event, song):
             yield r
 
@@ -1721,6 +1728,7 @@ class NeteaseUnblockPlugin(Star):
             yield r
 
     async def _set_mode_flow(self, event: AstrMessageEvent, m: str):
+        await self._react(event)  # 命令回执
         alias = {
             "卡片": "card", "音乐卡片": "card", "card": "card",
             "文件": "file", "音乐文件": "file", "file": "file",
@@ -1758,9 +1766,10 @@ class NeteaseUnblockPlugin(Star):
             yield r
 
     async def _help_flow(self, event: AstrMessageEvent):
+        await self._react(event)  # 命令回执
         mode = self.send_mode
         tips = (
-            "🎵 网易云音乐点歌-flac v2.0\n"
+            "🎵 网易云音乐点歌-flac v2.4\n"
             "══════════════════\n"
             "📖 命令（加不加 / 前缀均可）\n"
             "点歌 <歌名>　　　搜索歌曲，回复序号选择\n"
