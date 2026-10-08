@@ -24,6 +24,12 @@
     "hint": "HEAD 探测返回的直链，过滤网易云 VIP 占位 HTML 页（bugpk 对 VIP 歌会返回假链接）。关闭可省一次探测请求，但可能发出无法播放的卡片。",
     "default": true
   },
+  "cross_platform": {
+    "description": "跨平台音源兜底",
+    "type": "string",
+    "hint": "网易云取不到直链时（版权下架的歌，如周杰伦），按这里的顺序去别家找【同一首原唱】。可选 kuwo（酷我）/ kugou（酷狗），逗号分隔；留空关闭。关键：这一步是在【跑机器人的机器】上直接连音源，跟后端部署在哪、后端连不连得上音源无关——所以后端在境外取不到周杰伦时，靠它照样能放。",
+    "default": "kuwo,kugou"
+  },
   "retract_list_seconds": {
     "description": "搜索结果自动撤回（秒）",
     "type": "int",

@@ -8,13 +8,14 @@
 """
 
 import asyncio
+import hashlib
 import os
 import random
 import re
 import time
 import uuid
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -52,6 +53,31 @@ FALLBACK_TRY_LIMIT = 5
 """原唱取不到直链时，最多再试几个同名版本（取到别的版本会明确提示用户）"""
 NETEASE_LEVEL = "exhigh"
 """走官方 /song/url/v1 时请求的音质（账号不支持会自动降级）"""
+
+# ---------------------------------------------------------------------- #
+# 跨平台备选音源：网易云取不到的（版权下架歌，如周杰伦），直接去别家找同一首
+# ---------------------------------------------------------------------- #
+KUWO_SEARCH_API = (
+    "http://search.kuwo.cn/r.s?&correct=1&vipver=1&stype=comprehensive&encoding=utf8"
+    "&rformat=json&mobi=1&show_copyright_off=1&searchapi=6&all={}"
+)
+KUWO_TRACK_API = (
+    "http://antiserver.kuwo.cn/anti.s?type=convert_url&format=mp3&response=url&rid=MUSIC_{}"
+)
+KUGOU_SEARCH_API = (
+    "http://mobilecdn.kugou.com/api/v3/search/song?keyword={}&page=1&pagesize=10"
+)
+KUGOU_TRACK_API = (
+    "http://trackercdn.kugou.com/i/v2/?key={key}&hash={hash}"
+    "&appid=1005&pid=2&cmd=25&behavior=play&album_id={album}"
+)
+UA_OKHTTP = {"user-agent": "okhttp/3.10.0"}
+_URL_RE = re.compile(r"""http[^\s$"']+""")
+PLATFORM_CN = {"kuwo": "酷我", "kugou": "酷狗"}
+CROSS_PLATFORM_DEFAULT = "kuwo,kugou"
+"""网易云取不到时，按顺序去哪些平台找同一首原唱；留空字符串关闭"""
+DURATION_TOLERANCE_MS = 3000
+"""跨平台匹配时认为「同一个版本」的时长容差"""
 MATCH_FAIL_HINT = (
     "💡 音源服务取不到就发不出歌。版权下架的原唱只有跨平台音源能取，"
     "服务若部署在境外（如 Vercel 默认美国节点）会连不上酷我——"
@@ -153,6 +179,9 @@ class NeteaseUnblockPlugin(Star):
         self.auto_pick = bool(config.get("auto_pick") or False)
         _po = config.get("prefer_original")
         self.prefer_original = True if _po is None else bool(_po)
+        _cp = config.get("cross_platform")
+        self.cross_platform = (CROSS_PLATFORM_DEFAULT if _cp is None
+                               else str(_cp).strip())
         self.limit = self._safe_int(config.get("limit"), 10)
         self.timeout = self._safe_float(config.get("timeout"), 15.0)
         self.proxy = (config.get("proxy") or "").strip()
@@ -590,6 +619,124 @@ class NeteaseUnblockPlugin(Star):
                 return item
         return None
 
+    # ------------------------------------------------------------------ #
+    # 跨平台找原唱（网易云版权下架的歌，去酷我/酷狗拿同一首）
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def _pick_best(cls, candidates: list[dict], song: dict) -> dict | None:
+        """在别家的搜索结果里挑出跟网易云这首「同一个版本」的那条。
+
+        判据：曲名必须干净同名（去掉括号注释），歌手对得上，时长越接近越好
+        （时长一致基本就是同一录音，能避开 Live / 翻唱 / 加速版）。
+        """
+        want_name = cls._base_title(song.get("name") or "")
+        want_artist = re.sub(r"\s|/", "", song.get("artists") or "")
+        want_dur = int(song.get("duration") or 0)
+        best: dict | None = None
+        best_score = 0
+        for cand in candidates:
+            if cls._base_title(cand.get("name") or "") != want_name:
+                continue  # 曲名对不上直接丢，宁缺毋滥
+            score = 60
+            artist = re.sub(r"\s|/", "", cand.get("artist") or "")
+            if want_artist and artist and (want_artist in artist or artist in want_artist):
+                score += 30
+            dur = int(cand.get("duration") or 0)
+            if want_dur and dur:
+                diff = abs(dur - want_dur)
+                if diff <= DURATION_TOLERANCE_MS:
+                    score += 40
+                elif diff <= DURATION_TOLERANCE_MS * 3:
+                    score += 15
+            if cls._looks_like_cover(cand.get("name") or ""):
+                score -= 50
+            if score > best_score:
+                best, best_score = cand, score
+        return best
+
+    async def _other_platform_url(self, song: dict) -> tuple[str, str] | None:
+        """网易云取不到时，去酷我/酷狗按「歌名 + 歌手」找同一首原唱。
+
+        返回 (直链, 平台名)。这几家是自己的曲库，周杰伦这类在网易云下架的歌
+        在酷我/酷狗反而是完整原版。
+        """
+        name = (song.get("name") or "").strip()
+        if not name:
+            return None
+        keyword = f"{name} {song.get('artists') or ''}".strip()
+        for key in (self.cross_platform or "").split(","):
+            key = key.strip().lower()
+            finder = {"kuwo": self._kuwo_url, "kugou": self._kugou_url}.get(key)
+            if not finder:
+                continue
+            try:
+                url = await finder(keyword, song)
+            except Exception as e:
+                logger.warning(f"[netease_unblock] {PLATFORM_CN.get(key, key)} 取直链异常: {e!r}")
+                continue
+            if not url:
+                continue
+            if self.verify_audio and not await self._is_audio(url):
+                logger.warning(f"[netease_unblock] {PLATFORM_CN.get(key, key)} 返回的不是音频，跳过")
+                continue
+            logger.info(f"[netease_unblock] 「{name}」改走{PLATFORM_CN.get(key, key)}取到原唱直链")
+            return url, PLATFORM_CN.get(key, key)
+        return None
+
+    async def _kuwo_url(self, keyword: str, song: dict) -> str | None:
+        resp = await self._unlock_client.get(KUWO_SEARCH_API.format(quote(keyword)))
+        resp.raise_for_status()
+        data = resp.json() or {}
+        content = data.get("content") or []
+        page = (content[1] if len(content) > 1 and isinstance(content[1], dict) else {})
+        rows = []
+        for item in ((page.get("musicpage") or {}).get("abslist") or []):
+            rid = str(item.get("MUSICRID") or "").split("_")[-1]
+            if not rid.isdigit():
+                continue
+            rows.append({
+                "id": rid,
+                "name": item.get("SONGNAME") or "",
+                "artist": item.get("ARTIST") or "",
+                "duration": int(item.get("DURATION") or 0) * 1000,
+            })
+        best = self._pick_best(rows, song)
+        if not best:
+            return None
+        resp = await self._unlock_client.get(KUWO_TRACK_API.format(best["id"]), headers=UA_OKHTTP)
+        match = _URL_RE.search(resp.text or "")
+        return match.group(0) if match else None
+
+    async def _kugou_url(self, keyword: str, song: dict) -> str | None:
+        resp = await self._unlock_client.get(KUGOU_SEARCH_API.format(quote(keyword)))
+        resp.raise_for_status()
+        rows = []
+        for item in (((resp.json() or {}).get("data") or {}).get("info") or []):
+            rows.append({
+                "id": item.get("hash"),
+                "id_hq": item.get("320hash"),
+                "id_sq": item.get("sqhash"),
+                "name": item.get("songname") or "",
+                "artist": item.get("singername") or "",
+                "album": item.get("album_id") or "",
+                "duration": int(item.get("duration") or 0) * 1000,
+            })
+        best = self._pick_best(rows, song)
+        if not best:
+            return None
+        for field in ("id_sq", "id_hq", "id"):  # 有损的优先，其次高码率
+            file_hash = best.get(field)
+            if not file_hash:
+                continue
+            digest = hashlib.md5(f"{file_hash}kgcloudv2".encode()).hexdigest()
+            resp = await self._unlock_client.get(KUGOU_TRACK_API.format(
+                key=digest, hash=file_hash, album=best.get("album") or ""))
+            urls = (resp.json() or {}).get("url") or []
+            url = urls[0] if urls else None
+            if isinstance(url, str) and url.startswith("http"):
+                return url
+        return None
+
     async def _is_audio(self, url: str) -> bool:
         """HEAD 探测直链内容类型，过滤网易云 VIP 占位 HTML 页。"""
         try:
@@ -632,8 +779,9 @@ class NeteaseUnblockPlugin(Star):
                                alternatives: list[dict] | None = None):
         """获取直链并构造发送结果（异步生成器）：按指定/默认模式发卡片 / 文件 / 语音 / 文本。
 
-        alternatives 是本次搜索的候选列表：首选那首取不到直链时（版权下架的歌
-        很常见），自动退而求其次换一个能播的版本，并明确告诉用户发的不是原唱。
+        首选那首（通常是原唱）取不到直链时，先按「歌名+歌手」去酷我/酷狗找**同一首**
+        ——版权下架的歌在这几家反而是完整原版；别家也找不到，才退回换一个能播的版本
+        并明确告诉用户发的不是原唱。
         """
         mode = mode or self.send_mode
         link = SONG_LINK.format(song["id"])
@@ -645,6 +793,14 @@ class NeteaseUnblockPlugin(Star):
             audio = None
 
         notice = ""
+        if not audio and self.cross_platform:
+            # 同一首歌换平台找：还是原唱，只是音源来自别家
+            found = await self._other_platform_url(song)
+            if found:
+                audio, platform = found
+                notice = (f"🎵 原唱「{song['name']} - {song['artists'] or '未知歌手'}」"
+                          f"网易云取不到，已改用{platform}音源：\n")
+
         if not audio and alternatives:
             tried = 0
             for alt in alternatives:
