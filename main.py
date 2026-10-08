@@ -31,6 +31,33 @@ from astrbot.core.star.filter.command import GreedyStr
 
 SELECT_TIMEOUT_SECONDS = 60
 """选歌序号的有效期（秒）"""
+ORIGINAL_SCAN_LIMIT = 15
+"""搜索时额外拉取并检查的候选数量：网易云前排常被翻唱占据，原唱可能排得很后"""
+DEEP_SCAN_PAGES = 7
+"""前排找不到原唱时的翻页深扫页数（每页 30 条，覆盖前 210 条）"""
+DEEP_SCAN_PAGE_SIZE = 30
+"""深扫每页条数"""
+DEEP_SCAN_PAUSE_SECONDS = 0.2
+"""深扫每页之间的间隔，降低触发网易云限流的概率"""
+SEARCH_CACHE_SECONDS = 120
+"""同一关键词的搜索结果缓存时长（秒）：群里多人点同一首歌时省掉重复请求"""
+UNRESOLVED_COVER_HINT = (
+    "⚠️ 这些结果都是翻唱／改编版，网易云没给出原唱条目。\n"
+    "要原唱可以：①「歌手 <歌手名>」看热门歌曲后回复序号；②「直链 <歌曲ID>」精确点歌。"
+)
+"""确认前排全是翻唱、又定位不到原唱时的提示"""
+PICK_HINT = f"想听哪首：回复序号直接点歌（{SELECT_TIMEOUT_SECONDS} 秒内有效，回复 0 取消）"
+"""列表类命令末尾的统一提示"""
+FALLBACK_TRY_LIMIT = 5
+"""原唱取不到直链时，最多再试几个同名版本（取到别的版本会明确提示用户）"""
+NETEASE_LEVEL = "exhigh"
+"""走官方 /song/url/v1 时请求的音质（账号不支持会自动降级）"""
+MATCH_FAIL_HINT = (
+    "💡 音源服务取不到就发不出歌。版权下架的原唱只有跨平台音源能取，"
+    "服务若部署在境外（如 Vercel 默认美国节点）会连不上酷我——"
+    "把服务跑在国内网络，或「直链 <歌曲ID>」单独试其它版本。"
+)
+"""直链获取失败的排查提示"""
 CACHE_JANITOR_SECONDS = 300
 """兜底清理阈值：超过该时长的会话缓存在任意消息到来时被清除"""
 DOWNLOAD_TIMEOUT_SECONDS = 300.0
@@ -62,6 +89,24 @@ HEADERS = {
 }
 
 _ID_FROM_URL = re.compile(r"[?&]id=(\d+)")
+_BRACKET_RE = re.compile(r"[（(\[【《][^）)\]】》]*[）)\]】》]")
+_COVER_ASCII_RE = re.compile(r"\b(cover|remix|dj|live|ai|instrumental|karaoke)\b")
+_CJK_COVER_MARKERS = (
+    "翻唱", "原唱", "深情版", "治愈版", "女声版", "男声版", "童声", "钢琴版",
+    "吉他版", "纯音乐", "伴奏", "混音", "加速版", "减速版", "烟嗓", "低音版",
+    "高音版", "合唱版", "改编", "串烧", "铃声", "片段", "清唱", "哼唱",
+    "口哨", "八音盒", "尤克里里", "现场版", "抖音", "完整版", "正式版",
+)
+
+
+class RateLimited(Exception):
+    """网易云返回「操作频繁」时抛出，供上层给出可读提示。"""
+
+
+class SearchResult(list):
+    """搜索结果列表，额外记一个标记：前排确认是翻唱但没能定位到原唱。"""
+
+    unresolved_covers = False
 
 
 class CustomMusic(Music):
@@ -106,6 +151,8 @@ class NeteaseUnblockPlugin(Star):
         self.unlock_api = (config.get("unlock_api") or "").rstrip("/")
         self.source = (config.get("source") or "").strip()
         self.auto_pick = bool(config.get("auto_pick") or False)
+        _po = config.get("prefer_original")
+        self.prefer_original = True if _po is None else bool(_po)
         self.limit = self._safe_int(config.get("limit"), 10)
         self.timeout = self._safe_float(config.get("timeout"), 15.0)
         self.proxy = (config.get("proxy") or "").strip()
@@ -138,6 +185,8 @@ class NeteaseUnblockPlugin(Star):
         self._download_dir.mkdir(parents=True, exist_ok=True)
 
         self._pending: dict[str, dict] = {}
+        self._search_cache: dict[str, tuple] = {}
+        self._bad_paths: set[str] = set()  # 后端不存在的取链接口，记住后不再重试
         # 音源服务单独走代理：本机网络可能对音源域名 TLS 干扰（直连被重置），
         # 而网易云搜索接口直连更快更稳，不跟着走代理。
         self._search_client = httpx.AsyncClient(
@@ -197,6 +246,7 @@ class NeteaseUnblockPlugin(Star):
             "cover": cover,
             "duration": song.get("duration") or song.get("dt") or 0,
             "fee": song.get("fee", 0),
+            "publish": album.get("publishTime") or song.get("publishTime") or 0,
         }
 
     @staticmethod
@@ -212,16 +262,231 @@ class NeteaseUnblockPlugin(Star):
         return text
 
     # ------------------------------------------------------------------ #
+    # 原唱识别（网易云搜索前排常年被翻唱占据）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _base_title(name: str) -> str:
+        """去掉括号注释后的干净曲名：「稻香 (钢琴版) [原唱: 周杰伦]」→「稻香」。"""
+        return _BRACKET_RE.sub("", name or "").strip().lower()
+
+    @staticmethod
+    def _looks_like_cover(name: str) -> bool:
+        """曲名带翻唱/改编标记（深情版、女声版、钢琴版、Live、Cover…）。"""
+        low = (name or "").lower()
+        return any(m in low for m in _CJK_COVER_MARKERS) or bool(_COVER_ASCII_RE.search(low))
+
+    @staticmethod
+    def _cover_markers(name: str) -> set:
+        """曲名里出现的翻唱/版本标记词。"""
+        low = (name or "").lower()
+        found = {m for m in _CJK_COVER_MARKERS if m in low}
+        found |= {m.group(0) for m in _COVER_ASCII_RE.finditer(low)}
+        return found
+
+    @classmethod
+    def _relevance(cls, keyword: str, song: dict) -> int:
+        """搜索相关度：同名优先；没点名版本时压翻唱，点名了就让同款版本浮上来。"""
+        target = cls._base_title(keyword)
+        name = song.get("name") or ""
+        base = cls._base_title(name)
+        score = 0
+        if base and base == target:
+            score += 100
+        elif target and target in base:
+            score += 50
+        elif base and base in target:
+            score += 20
+        wanted = cls._cover_markers(keyword)
+        have = cls._cover_markers(name)
+        if wanted:
+            # 用户点名要版本（「稻香 深情版」）：带同款标记的加分，其余不额外压
+            score += 40 * len(wanted & have)
+        elif have:
+            score -= 60
+        return score - max(0, len(name) - len(keyword)) // 4
+
+    async def _get_details(self, ids: list) -> dict:
+        """批量取歌曲详情，返回 {id: 详情原始字典}（一次请求查多个候选）。"""
+        clean = [str(i) for i in ids if i]
+        if not clean:
+            return {}
+        try:
+            resp = await self._search_client.get(
+                SONG_DETAIL_API, params={"ids": "[" + ",".join(clean) + "]"}
+            )
+            resp.raise_for_status()
+            songs = (resp.json() or {}).get("songs") or []
+        except Exception as e:
+            logger.warning(f"[netease_unblock] 批量歌曲详情失败: {e!r}")
+            return {}
+        return {s.get("id"): s for s in songs if s.get("id")}
+
+    async def _find_original_deep(self, keyword: str, older_than: int = 0) -> dict | None:
+        """翻页深扫，找「干净同名 + 发行最早」的那条作为原唱。
+
+        网易云会把原唱压到很后面：「告白气球」的周杰伦原版在第 6 页，前 50 条里
+        45 条是翻唱。而且 originCoverType=1 并不等于原唱（大量改编版也是 1），
+        所以判据用「曲名没有括号后缀 + 专辑发行时间最早」——翻唱必然晚于原唱。
+        只返回比 older_than 更早的条目，避免把原本就对的第一条挤下去。
+        """
+        target = self._base_title(keyword)
+        best: dict | None = None
+        best_ts = 0
+        seen: set = set()
+        for page in range(DEEP_SCAN_PAGES):
+            if page:
+                await asyncio.sleep(DEEP_SCAN_PAUSE_SECONDS)
+            try:
+                rows = await self._search_page(
+                    keyword, page * DEEP_SCAN_PAGE_SIZE, DEEP_SCAN_PAGE_SIZE
+                )
+            except RateLimited:
+                logger.warning("[netease_unblock] 深扫被限流，停止翻页")
+                break
+            except Exception as e:
+                logger.warning(f"[netease_unblock] 深扫第 {page + 1} 页失败: {e!r}")
+                break
+            if not rows:
+                break
+            for row in rows:
+                if row.get("id") in seen:
+                    continue
+                seen.add(row.get("id"))
+                name = row.get("name") or ""
+                # 只看「光秃秃的同名」条目：带括号后缀的几乎都是翻唱/改编/现场版
+                if _BRACKET_RE.search(name) or self._base_title(name) != target:
+                    continue
+                ts = ((row.get("album") or {}).get("publishTime")
+                      or row.get("publishTime") or 0)
+                if not ts or (older_than and ts >= older_than):
+                    continue
+                if best is None or ts < best_ts:
+                    best, best_ts = row, ts
+            if len(rows) < DEEP_SCAN_PAGE_SIZE:
+                break
+        if best is None:
+            return None
+        logger.info(f"[netease_unblock] 深扫定位到更早的同名版本: {best.get('name')} id={best.get('id')}")
+        return self._normalize(best)
+
+    async def _promote_originals(self, keyword: str, songs: list[dict]) -> tuple[list[dict], bool]:
+        """把前排翻唱替换成原唱，返回 (结果列表, 是否「全是翻唱且没找到原唱」)。
+
+        搜索「稻香」时前排是「稻香(深情版) - Lucky小爱」，周杰伦的原唱甚至不进前 10。
+        好在翻唱的歌曲详情里带 originSongSimpleData，直接给出原唱 songId，据此前移。
+        """
+        if not songs or self._looks_like_cover(keyword):
+            return songs, False  # 用户点名要翻唱版（如「点歌 稻香 深情版」）时不干预
+        head = songs[:ORIGINAL_SCAN_LIMIT]
+        details = await self._get_details([s["id"] for s in head])
+        if not details:
+            return songs, False
+
+        target = self._base_title(keyword)
+        known = {s["id"] for s in songs}
+        orig_ids: set = set()
+        covers: set = set()
+        replaced: dict = {}
+        for song in head:
+            detail = details.get(song["id"]) or {}
+            origin = detail.get("originSongSimpleData") or {}
+            oid = origin.get("songId")
+            # originCoverType 2/3 = 网易云认定这是翻唱/改编（哪怕它没给原唱 songId）
+            if detail.get("originCoverType") in (2, 3):
+                covers.add(song["id"])
+            if not oid:
+                continue
+            covers.add(song["id"])
+            # 标注的原唱必须与本次搜索同名，否则可能是张冠李戴的转辑版本
+            if oid in known or oid in orig_ids or self._base_title(origin.get("name") or "") != target:
+                continue
+            original = await self._get_song_detail(oid)
+            if original is None or self._base_title(original["name"]) != target:
+                continue
+            replaced[song["id"]] = original
+            orig_ids.add(oid)
+            known.add(oid)
+
+        out = [replaced.get(s["id"], s) for s in songs]
+        if not covers:
+            return out, False
+
+        # 网易云明确标注出的原唱直接排最前：同名但未标注的重录版（「稻香 - Lie」这类）
+        # 相关度会打平，只靠打分排不到第一位。
+        originals = [s for s in out if s["id"] in orig_ids]
+        rest = [s for s in out if s["id"] not in orig_ids]
+        rest.sort(
+            key=lambda s: self._relevance(keyword, s) - (40 if s["id"] in covers else 0),
+            reverse=True,
+        )
+
+        if originals:
+            return originals + rest, False
+        if not covers:
+            return rest, False  # 前排没发现翻唱，不动它
+
+        top = rest[0] if rest else None
+        top_id = top["id"] if top else None
+        # 前排没找到原唱，且这个曲名下翻唱扎堆 → 原唱多半被压到了后面，翻页深扫一次。
+        # （「告白气球」的原版在第 6 页；前排还混着未标注的重录版，
+        #   而 originCoverType=1 也不可信，所以只能靠发行时间判断）
+        deep = await self._find_original_deep(
+            keyword, older_than=(top or {}).get("publish") or 0
+        )
+        if deep:
+            return [deep] + [s for s in rest if s["id"] != deep["id"]], False
+        # 深扫也没找到更早的同名版本：只有第一条被确认是翻唱时才提示用户
+        return rest, top_id in covers
+
+    # ------------------------------------------------------------------ #
     # API 请求
     # ------------------------------------------------------------------ #
-    async def _search(self, keyword: str) -> list[dict]:
+    async def _search_page(self, keyword: str, offset: int, limit: int) -> list[dict]:
+        """取一页搜索结果。被网易云限流时抛 RateLimited，其余异常照常抛出。"""
         resp = await self._search_client.get(
             SEARCH_API,
-            params={"s": keyword, "type": 1, "offset": 0, "limit": self.limit, "total": "true"},
+            params={
+                "s": keyword,
+                "type": 1,
+                "offset": offset,
+                "limit": limit,
+                "total": "true",
+            },
         )
         resp.raise_for_status()
-        songs = ((resp.json() or {}).get("result") or {}).get("songs") or []
-        return [self._normalize(s) for s in songs]
+        payload = resp.json() or {}
+        if payload.get("code") == 406 or "操作频繁" in str(payload.get("msg") or ""):
+            raise RateLimited()
+        return ((payload.get("result") or {}).get("songs")) or []
+
+    async def _search(self, keyword: str, limit: int | None = None) -> list[dict]:
+        """搜索歌曲：多拉候选 → 相关度排序 → 把翻唱换成原唱（结果带短时缓存）。"""
+        want = limit or self.limit
+        now = time.time()
+        hit = self._search_cache.get(keyword)
+        if hit and now - hit[0] < SEARCH_CACHE_SECONDS:
+            rows, unresolved = hit[1], hit[2]
+        else:
+            rows, unresolved = await self._search_fresh(keyword)
+            self._search_cache[keyword] = (now, rows, unresolved)
+            if len(self._search_cache) > 100:  # 顺手清掉过期项，别让缓存无限涨
+                for stale in [k for k, v in self._search_cache.items()
+                              if now - v[0] >= SEARCH_CACHE_SECONDS]:
+                    self._search_cache.pop(stale, None)
+        out = SearchResult(rows[:want])
+        out.unresolved_covers = unresolved
+        return out
+
+    async def _search_fresh(self, keyword: str) -> tuple[list[dict], bool]:
+        """真正走网络的搜索：拉候选、排序、尝试换成原唱。"""
+        fetch = max(self.limit, ORIGINAL_SCAN_LIMIT)
+        songs = await self._search_page(keyword, 0, fetch)
+        result = [self._normalize(s) for s in songs]
+        result.sort(key=lambda s: self._relevance(keyword, s), reverse=True)
+        unresolved = False
+        if self.prefer_original:
+            result, unresolved = await self._promote_originals(keyword, result)
+        return result, unresolved
 
     async def _get_song_detail(self, song_id: str) -> dict | None:
         resp = await self._search_client.get(
@@ -232,44 +497,97 @@ class NeteaseUnblockPlugin(Star):
         return self._normalize(songs[0]) if songs else None
 
     async def _match(self, song_id) -> str | None:
-        """调用自部署的音源服务（UnblockNeteaseMusic-utils），返回可播放直链。
+        """取可播放直链，自动适配两种后端。
 
-        source 支持逗号分隔的优先级列表（如 "byfuns,ddyr,auto"），逐个尝试；
-        auto 表示交给服务端自动选择（含 bugpk 兜底）。byfuns/ddyr 默认请求
-        无损/Hi-Res，排前面可让免费歌直接吃无损。
+        ① UnblockNeteaseMusic-utils：`/match?id=&source=`
+        ② 网易云 API Enhanced（自带解灰）：`/song/url/match?id=&source=`，
+           再退回 `/song/url/v1?id=&level=&unblock=true`，最后是官方 `/song/url/v1`。
+        哪个后端装在 API 地址上就用哪个，装错了也能自己认出来（打不通的路径记下来不再重试）。
         """
         if not self.unlock_api:
             return None
-        if self.source:
-            sources = [s.strip() for s in self.source.replace("，", ",").split(",") if s.strip()]
-        else:
-            sources = ["auto"]
-        tried: set[str] = set()
-        for name in sources:
+
+        # 解灰类接口：按配置的音源优先级逐个试
+        for path in ("/match", "/song/url/match"):
+            if path in self._bad_paths:
+                continue
+            for name in self._source_list():
+                params = {"id": str(song_id)}
+                if name:
+                    params["source"] = name
+                url = await self._api_url(path, params)
+                if url:
+                    return url
+
+        # 官方接口兜底：配了 VIP Cookie 的部署能直接返回可听直链
+        for params in (
+            {"id": str(song_id), "level": NETEASE_LEVEL, "unblock": "true"},
+            {"id": str(song_id), "level": NETEASE_LEVEL},
+        ):
+            url = await self._api_url("/song/url/v1", params)
+            if url:
+                return url
+        return None
+
+    def _source_list(self) -> list[str]:
+        """配置里的音源优先级；auto 用空串表示「交给服务端自动选」。"""
+        if not self.source:
+            return [""]
+        names = [s.strip() for s in self.source.replace("，", ",").split(",") if s.strip()]
+        out: list[str] = []
+        for name in names:
             token = "" if name.lower() == "auto" else name
-            key = token or "auto"
-            if key in tried:
-                continue
-            tried.add(key)
-            params = {"id": str(song_id)}
-            if token:
-                params["source"] = token
-            try:
-                resp = await self._unlock_client.get(f"{self.unlock_api}/match", params=params)
-                resp.raise_for_status()
-                payload = resp.json()
-            except Exception as e:
-                logger.warning(f"[netease_unblock] 音源 {key} 请求失败: {e!r}")
-                continue
-            data = payload.get("data") if isinstance(payload, dict) else None
-            url = data.get("url") if isinstance(data, dict) else None
-            if not (isinstance(url, str) and url.startswith("http")):
-                continue
-            if self.verify_audio and not await self._is_audio(url):
-                logger.warning(f"[netease_unblock] 音源 {key} 返回的不是音频（疑似 VIP 占位页），跳过")
-                continue
-            logger.info(f"[netease_unblock] 歌曲 {song_id} 命中音源: {key}")
-            return url
+            if token not in out:
+                out.append(token)
+        return out or [""]
+
+    async def _api_url(self, path: str, params: dict) -> str | None:
+        """请求一个取直链接口并校验，返回可用 URL；接口不存在就记下来不再重试。"""
+        try:
+            resp = await self._unlock_client.get(f"{self.unlock_api}{path}", params=params)
+        except Exception as e:
+            logger.warning(f"[netease_unblock] {path} 请求失败: {e!r}")
+            return None
+        if resp.status_code == 404:
+            self._bad_paths.add(path)
+            logger.info(f"[netease_unblock] {path} 在 {self.unlock_api} 上不存在，后续跳过")
+            return None
+        try:
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as e:
+            logger.warning(f"[netease_unblock] {path} 响应异常: {str(e)[:80]}")
+            return None
+        url = self._extract_url(payload)
+        if not url:
+            return None
+        if self.verify_audio and not await self._is_audio(url):
+            logger.warning(f"[netease_unblock] {path} 返回的不是音频（疑似 VIP 占位页），跳过")
+            return None
+        logger.info(f"[netease_unblock] 歌曲 {params.get('id')} 命中 {path}"
+                    f"{'/' + params['source'] if params.get('source') else ''}")
+        return url
+
+    @staticmethod
+    def _extract_url(payload) -> str | None:
+        """兼容各家返回结构：data 直接是 URL / data 是 [{url}] / data 是 {url}。"""
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get("data")
+        candidates = []
+        if isinstance(data, str):
+            candidates.append(data)
+        elif isinstance(data, dict):
+            candidates += [data.get("url"), data.get("proxyUrl")]
+        elif isinstance(data, list) and data:
+            head = data[0]
+            if isinstance(head, dict):
+                candidates += [head.get("url"), head.get("proxyUrl")]
+        # 顶层也有的放最后
+        candidates += [payload.get("url"), payload.get("proxyUrl")]
+        for item in candidates:
+            if isinstance(item, str) and item.startswith("http"):
+                return item
         return None
 
     async def _is_audio(self, url: str) -> bool:
@@ -309,8 +627,14 @@ class NeteaseUnblockPlugin(Star):
         except Exception as e:
             logger.warning(f"[netease_unblock] 表情回应失败: {e!r}")
 
-    async def _resolve_results(self, event: AstrMessageEvent, song: dict, mode: str | None = None):
-        """获取直链并构造发送结果（异步生成器）：按指定/默认模式发卡片 / 文件 / 语音 / 文本。"""
+    async def _resolve_results(self, event: AstrMessageEvent, song: dict,
+                               mode: str | None = None,
+                               alternatives: list[dict] | None = None):
+        """获取直链并构造发送结果（异步生成器）：按指定/默认模式发卡片 / 文件 / 语音 / 文本。
+
+        alternatives 是本次搜索的候选列表：首选那首取不到直链时（版权下架的歌
+        很常见），自动退而求其次换一个能播的版本，并明确告诉用户发的不是原唱。
+        """
         mode = mode or self.send_mode
         link = SONG_LINK.format(song["id"])
         try:
@@ -320,13 +644,42 @@ class NeteaseUnblockPlugin(Star):
             logger.error(f"[netease_unblock] 音源请求异常: {e!r} {hint}")
             audio = None
 
+        notice = ""
+        if not audio and alternatives:
+            tried = 0
+            for alt in alternatives:
+                if tried >= FALLBACK_TRY_LIMIT:
+                    break
+                if alt.get("id") == song.get("id"):
+                    continue
+                tried += 1
+                try:
+                    url = await self._match(alt["id"])
+                except Exception:
+                    url = None
+                if not url:
+                    continue
+                notice = (
+                    f"⚠️ 原唱「{song['name']} - {song['artists'] or '未知歌手'}」取不到直链，"
+                    f"换成这一版：\n"
+                )
+                logger.info(f"[netease_unblock] {song['id']} 取不到直链，回退到 {alt['id']}")
+                song, audio = alt, url
+                link = SONG_LINK.format(song["id"])
+                break
+
         if not audio:
+            api = self.unlock_api or "（未配置 API 地址）"
             yield event.plain_result(
                 f"❌ {song['name']} - {song['artists'] or '未知歌手'}\n"
-                "获取直链失败：音源服务无可用音源或站点不可达\n"
+                f"获取直链失败：音源服务 {api} 没有可用音源或不可达\n"
+                f"{MATCH_FAIL_HINT}\n"
                 f"🔗 {link}"
             )
             return
+
+        if notice:
+            yield event.plain_result(notice)
 
         if mode == "file":
             async for r in self._send_file(event, song, audio):
@@ -653,6 +1006,15 @@ class NeteaseUnblockPlugin(Star):
             return None
         return songs[0]["id"] if songs else None
 
+    def _remember_pick(self, event: AstrMessageEvent, songs: list[dict], mode: str | None = None) -> None:
+        """登记序号选歌缓存：列表类命令发完后，用户直接回复数字即可点歌。"""
+        self._pending[self._cache_key(event)] = {
+            "stage": "pick_song",
+            "songs": songs,
+            "ts": time.time(),
+            "mode": mode,
+        }
+
     async def _lyrics_flow(self, event: AstrMessageEvent, text: str):
         if not text:
             yield event.plain_result("用法：歌词 <歌名|ID>（如：歌词 晴天 或 歌词 晴天|186016）")
@@ -677,9 +1039,15 @@ class NeteaseUnblockPlugin(Star):
             yield event.plain_result("❌ 排行榜获取失败")
             return
         if not arg:
-            lines = ["🏆 官方排行榜（回复「排行 榜单名」查看曲目）："]
-            for i, b in enumerate(boards[:15], 1):
+            shown = boards[:15]
+            lines = ["🏆 官方排行榜（回复序号查看曲目，或「排行 榜单名」）："]
+            for i, b in enumerate(shown, 1):
                 lines.append(f"{i}. {b.get('name')}（{b.get('updateFrequency') or ''}）")
+            self._pending[self._cache_key(event)] = {
+                "stage": "pick_board",
+                "boards": [{"id": b.get("id"), "name": b.get("name")} for b in shown],
+                "ts": time.time(),
+            }
             yield event.plain_result("\n".join(lines))
             return
         target = next(
@@ -694,10 +1062,12 @@ class NeteaseUnblockPlugin(Star):
         if not tracks:
             yield event.plain_result("❌ 榜单曲目获取失败")
             return
+        shown = [self._normalize(s) for s in tracks[:10]]
         lines = [f"🏆 {target.get('name')}（{target.get('updateFrequency') or ''}）"]
-        for i, s in enumerate(tracks[:10], 1):
-            lines.append(f"{i}. {self._fmt(self._normalize(s))}")
-        lines.append("想听哪首：点歌 歌名")
+        for i, song in enumerate(shown, 1):
+            lines.append(f"{i}. {self._fmt(song)}")
+        self._remember_pick(event, shown)
+        lines.append(PICK_HINT)
         yield event.plain_result("\n".join(lines))
 
     async def _artist_flow(self, event: AstrMessageEvent, kw: str):
@@ -718,10 +1088,12 @@ class NeteaseUnblockPlugin(Star):
         if not hot:
             yield event.plain_result("❌ 热门歌曲获取失败")
             return
+        shown = [self._normalize(s) for s in hot[:10]]
         lines = [f"🎤 {target.get('name')} 的热门歌曲"]
-        for i, s in enumerate(hot[:10], 1):
-            lines.append(f"{i}. {self._fmt(self._normalize(s))}")
-        lines.append("想听哪首：点歌 歌名")
+        for i, song in enumerate(shown, 1):
+            lines.append(f"{i}. {self._fmt(song)}")
+        self._remember_pick(event, shown)
+        lines.append(PICK_HINT)
         yield event.plain_result("\n".join(lines))
 
     async def _album_flow(self, event: AstrMessageEvent, kw: str):
@@ -745,13 +1117,17 @@ class NeteaseUnblockPlugin(Star):
         artist_name = ((target.get("artist") or {}).get("name")) or (
             ((detail or {}).get("album") or {}).get("artist") or {}
         ).get("name") or ""
-        lines = [f"💿 专辑《{target.get('name')}》- {artist_name}（共 {len(songs)} 首）"]
-        for i, s in enumerate(songs[:10], 1):
+        shown = []
+        for s in songs[:10]:
             song = self._normalize(s)
             if not song.get("album"):
                 song["album"] = target.get("name") or ""
+            shown.append(song)
+        lines = [f"💿 专辑《{target.get('name')}》- {artist_name}（共 {len(songs)} 首）"]
+        for i, song in enumerate(shown, 1):
             lines.append(f"{i}. {self._fmt(song)}")
-        lines.append("想听哪首：点歌 歌名")
+        self._remember_pick(event, shown)
+        lines.append(PICK_HINT)
         yield event.plain_result("\n".join(lines))
 
     async def _playlist_flow(self, event: AstrMessageEvent, kw: str):
@@ -774,10 +1150,12 @@ class NeteaseUnblockPlugin(Star):
             return
         play = target.get("playCount")
         play = f"{play} 次播放" if play else "热门歌单"
+        shown = [self._normalize(s) for s in tracks[:10]]
         lines = [f"📋 歌单《{target.get('name')}》（{play}）"]
-        for i, s in enumerate(tracks[:10], 1):
-            lines.append(f"{i}. {self._fmt(self._normalize(s))}")
-        lines.append("想听哪首：点歌 歌名")
+        for i, song in enumerate(shown, 1):
+            lines.append(f"{i}. {self._fmt(song)}")
+        self._remember_pick(event, shown)
+        lines.append(PICK_HINT)
         yield event.plain_result("\n".join(lines))
 
     async def _comments_flow(self, event: AstrMessageEvent, text: str):
@@ -814,10 +1192,12 @@ class NeteaseUnblockPlugin(Star):
         if not songs:
             yield event.plain_result("❌ 新歌速递获取失败")
             return
+        shown = [self._normalize(s) for s in songs[:10]]
         lines = [f"🆕 {area}新歌速递："]
-        for i, s in enumerate(songs[:10], 1):
-            lines.append(f"{i}. {self._fmt(self._normalize(s))}")
-        lines.append("想听哪首：点歌 歌名")
+        for i, song in enumerate(shown, 1):
+            lines.append(f"{i}. {self._fmt(song)}")
+        self._remember_pick(event, shown)
+        lines.append(PICK_HINT)
         yield event.plain_result("\n".join(lines))
 
     async def _random_flow(self, event: AstrMessageEvent):
@@ -885,13 +1265,17 @@ class NeteaseUnblockPlugin(Star):
             idx = int(kw)
             if 1 <= idx <= len(songs):
                 self._pending.pop(key, None)
-                async for r in self._resolve_results(event, songs[idx - 1], pending.get("mode")):
+                async for r in self._resolve_results(event, songs[idx - 1],
+                                                     pending.get("mode"), alternatives=songs):
                     yield r
                 event.stop_event()
                 return
 
         try:
             songs = await self._search(kw)
+        except RateLimited:
+            yield event.plain_result("⏳ 网易云提示操作频繁，请稍等十几秒再点歌")
+            return
         except Exception as e:
             logger.error(f"[netease_unblock] 搜索失败: {e!r}", exc_info=True)
             yield event.plain_result("❌ 搜索歌曲失败，请稍后重试")
@@ -901,13 +1285,17 @@ class NeteaseUnblockPlugin(Star):
             return
 
         if self.auto_pick or len(songs) == 1:
-            async for r in self._resolve_results(event, songs[0], mode):
+            if getattr(songs, "unresolved_covers", False):
+                yield event.plain_result(UNRESOLVED_COVER_HINT)
+            async for r in self._resolve_results(event, songs[0], mode, alternatives=songs):
                 yield r
             return
 
         lines = ["🎵 搜索结果："]
         for i, song in enumerate(songs, 1):
             lines.append(f"{i}. {self._fmt(song)}")
+        if getattr(songs, "unresolved_covers", False):
+            lines.append(UNRESOLVED_COVER_HINT)
         lines.append(f"回复序号选择（{SELECT_TIMEOUT_SECONDS} 秒内有效，回复 0 取消）")
         self._pending[key] = {"stage": "pick_song", "songs": songs, "ts": time.time(), "mode": mode}
 
@@ -1040,6 +1428,7 @@ class NeteaseUnblockPlugin(Star):
             "新歌 [地区]　　新歌速递(华语/欧美/日本/韩国)\n"
             "来首歌　　　　　随机来一首\n"
             "连播 [数量]　　连播当前列表(语音,≤10)\n"
+            "（上面这些列表都能直接回复序号点歌）\n"
             "══════════════════\n"
             "💡 示例\n"
             "点歌 咏春\n"
@@ -1217,12 +1606,25 @@ class NeteaseUnblockPlugin(Star):
             event.stop_event()
             return
 
+        # 「排行」列表：数字选的是榜单，进去看曲目
+        if cache.get("stage") == "pick_board":
+            boards = cache.get("boards") or []
+            if not (1 <= idx <= len(boards)):
+                return  # 超出范围的数字视为普通聊天，不拦截
+            self._pending.pop(key, None)
+            await self._react(event)
+            async for r in self._toplist_flow(event, boards[idx - 1].get("name") or ""):
+                yield r
+            event.stop_event()
+            return
+
         songs = cache["songs"]
         if not (1 <= idx <= len(songs)):
             return  # 超出范围的数字视为普通聊天，不拦截
 
         self._pending.pop(key, None)  # 进入执行即销毁，防止重复触发
         await self._react(event)  # 选中序号同样贴表情回执
-        async for r in self._resolve_results(event, songs[idx - 1], cache.get("mode")):
+        async for r in self._resolve_results(event, songs[idx - 1], cache.get("mode"),
+                                             alternatives=songs):
             yield r
         event.stop_event()

@@ -10,6 +10,8 @@ AstrBot 网易云音乐点歌-flac 插件：搜索网易云音乐，配合你自
 
 - `点歌 <歌名>`：搜索网易云音乐，回复序号选歌（或配置为自动点第一首）
 - `点歌 <序号>`：直接选择上一次搜索结果的第 N 首
+- **优先原唱**：搜索结果前排常被翻唱/改编版占据（搜「稻香」第一条是「稻香(深情版)」，周杰伦原唱甚至不进前 10；搜「告白气球」前 50 条有 45 条翻唱，原版被压到第 6 页）。插件会按相关度重排、读原唱标注 `originSongSimpleData` 直接换成原唱，必要时翻页深扫按「专辑发行时间最早」把原版捞回来；实在找不到就明确提示是翻唱版。想点翻唱版就在关键词里写明（如 `点歌 稻香 深情版`），可在配置里关闭
+- `排行` / `歌手` / `专辑` / `歌单` / `新歌` 等列表同样可以直接**回复序号点歌**，无需重打歌名
 - `直链 <歌曲ID或分享链接>`：按歌曲 ID 或分享链接获取直链，支持 `https://music.163.com/song?id=xxx` 格式的链接
 - `点歌模式 [卡片|文件|文本]`：查看或切换发送方式（保存进配置，重启保留）
 - `帮助`：查看使用帮助与当前模式
@@ -42,11 +44,12 @@ AstrBot 网易云音乐点歌-flac 插件：搜索网易云音乐，配合你自
 
 | 配置项          | 默认值                       | 说明                                                 |
 | ------------ | ------------------------- | -------------------------------------------------- |
-| `API 地址`（unlock_api） | 空 | 你部署的 UnblockNeteaseMusic-utils 地址，末尾不带 `/`。**项目地址：https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils ，部署教程见下文** |
+| `API 地址`（unlock_api） | 空 | 你部署的网易云服务地址，末尾不带 `/`。**两种后端都支持，插件自动识别**：① [网易云 API Enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced)（推荐，自带解灰 `/song/url/match`）；② [UnblockNeteaseMusic-utils](https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils)。部署教程见下文 |
 | `代理`（proxy）     | 空                         | 访问音源服务走的代理，如 `http://127.0.0.1:7897`。仅音源请求走代理，搜索仍直连 |
 | `音源优先级`（source）     | `byfuns,ddyr,auto`         | 逗号分隔按顺序尝试。byfuns/ddyr 默认请求无损；`auto`=服务端自动（bugpk 兜底） |
 | `校验音频直链`（verify_audio） | `true`                   | HEAD 探测直链过滤 VIP 占位 HTML 假链接 |
 | `自动点第一首`（auto_pick）  | `false`                   | 开启后点歌直接发送第一首结果，不再列序号                               |
+| `优先原唱`（prefer_original） | `true`                 | 自动把搜索前排的翻唱替换成网易云标注的原唱；关键词里写明版本（如 `稻香 深情版`）时不干预 |
 | `搜索结果数量`（limit）      | `10`                      | 单次搜索返回数量                                             |
 | `请求超时`（timeout）    | `15.0`                    | API 请求超时（秒）                                         |
 | `歌曲发送模式`（send_mode） | `card`                        | `card` 卡片 / `file` 文件 / `text` 文本，可用「点歌模式」命令切换 |
@@ -55,32 +58,46 @@ AstrBot 网易云音乐点歌-flac 插件：搜索网易云音乐，配合你自
 | `命令表情回应`（react_emoji） | `319`（比心）                    | 命令贴表情的 ID/Unicode 码点（319=比心、128077=👍、49=强），留空关闭 |
 | `命令必须加 / 前缀`（require_prefix） | `false`               | 开启 = 必须 `/点歌`；关闭 = 直接发 `点歌` |
 
-## 部署音源服务教程
+## 部署后端服务教程
 
-插件需要一个 [UnblockNeteaseMusic-utils](https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils) 服务作为音源后端，任选一种方式部署：
+插件需要一个网易云后端。**两种都支持，插件自动识别**，推荐第一种：
 
-### 方式一：Vercel 部署（推荐，免费免服务器）
+- **网易云 API Enhanced**（自带解灰 `/song/url/match`，功能最全）：https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced
+- **UnblockNeteaseMusic-utils**（纯解灰服务）：https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils
 
-1. 打开 https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils ，点右上角 **Fork** 到自己账号；
-2. 打开 https://vercel.com 并用 GitHub 账号登录，**Add New → Project**，导入刚 Fork 的仓库，保持默认直接 **Deploy**；
-3. 部署完成后会得到 `xxx.vercel.app` 地址（大陆直连可能不通），建议在 Vercel 项目的 **域名** 设置里绑定自己的域名（Cloudflare 托管的域名加一条 CNAME 指向 Vercel 即可）；
-4. 浏览器打开你的域名，看到「UnblockNeteaseMusic Utils」状态页即部署成功；
-5. 把该地址填进插件配置的 `API 地址`。
+### 方式一：服务器 / 本机源码运行（推荐）
 
-### 方式二：服务器 / 本机源码运行
-
-需要 Node.js 18+，和 AstrBot 同机部署最安全（不必暴露公网）：
+和 AstrBot 同机（或任意国内网络机器）运行最稳，不必暴露公网，解灰也能正常连酷我：
 
 ```bash
-git clone https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils.git
-cd UnblockNeteaseMusic-utils
-npm install
-npm start        # 默认 3000 端口，可用 PORT=4000 npm start 换端口
+git clone https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced.git
+cd api-enhanced
+pnpm i          # 或 npm i
+pnpm start      # 默认 3000 端口；pnpm start --port 4000 换端口
 ```
 
-验证：`curl "http://127.0.0.1:3000/inner/version"` 返回版本 JSON 即成功。此时 `API 地址` 填 `http://127.0.0.1:3000`。
+此时 `API 地址` 填 `http://127.0.0.1:3000`。
+
+### 方式二：Vercel 部署（免费，但有坑）
+
+1. Fork https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced ，在 Vercel **Add New → Project** 导入，直接 Deploy；
+2. **务必把函数区域改成香港**：`vercel.json` 里加 `"regions": ["hkg1"]`，或在 Vercel 项目 Settings → Functions → Function Region 选 Hong Kong；
+3. 绑定自己的域名（Cloudflare 加 CNAME 指向 Vercel）；
+4. 把域名填进插件配置的 `API 地址`。
+
+> ⚠️ **Vercel 默认区域是美国（iad1），解灰要连酷我/酷狗，从美国节点连不上**——结果是普通歌和 VIP 歌能放，但版权下架的（周杰伦等）取不到直链。改成香港区域能改善；要彻底稳定还是用方式一。
+> 想在 Vercel 上放 VIP 歌，可在项目的环境变量里设 `NETEASE_COOKIE="MUSIC_U=xxx"`（自己的会员 Cookie）。
 
 ### 部署后验证
+
+```bash
+curl "<你的API地址>/inner/version"          # 返回版本 JSON 即服务活着
+curl "<你的API地址>/song/url/match?id=185709"   # 周杰伦 稻香，能返回 http 直链才算解灰正常
+```
+
+如果第二条返回 `{"code":500,"msg":"Cannot read properties of null..."}`，说明**解灰没匹配到音源**（多半是部署在境外连不上酷我），换方式一或改香港区域。
+
+### 旧版验证命令
 
 ```bash
 curl "<你的API地址>/inner/version"      # 应返回 {"code":200,"data":{"version":"..."}}
@@ -95,9 +112,12 @@ curl "<你的API地址>/match?id=1498523311" # 应返回包含直链的 JSON
 
 ## 常见问题
 
-- **提示"获取直链失败"**：先在**运行 AstrBot 的机器**上确认音源服务可达：`curl "<你的API地址>/inner/version"`，正常应返回版本 JSON。若本机网络对该域名 TLS 握手被重置（部分网络对非常见后缀域名有干扰），可在插件配置 `代理` 里填本机代理（如 Clash 的 `http://127.0.0.1:7897`），只有音源请求走代理，搜索仍直连。
+- **提示"获取直链失败"**：错误消息里会带上 API 地址与排查提示。先在**运行 AstrBot 的机器**上确认服务可达：`curl "<你的API地址>/inner/version"`。若本机网络对该域名 TLS 握手被重置（部分网络对非常见后缀域名有干扰），可在插件配置 `代理` 里填本机代理（如 Clash 的 `http://127.0.0.1:7897`），只有音源请求走代理。**换了后端（如从 unblock-utils 换成 api-enhanced）不用改插件**，插件会自动识别 `/match` 还是 `/song/url/match`。
+- **周杰伦这类歌一直取不到直链**：版权下架的歌网易云自己都不给放（`/song/url/v1` 返回 `url: null`），只能靠解灰去酷我/酷狗找，而**解灰在境外节点连不上酷我**。把后端跑在国内网络、或把 Vercel 函数区域改成香港（`vercel.json` 加 `"regions": ["hkg1"]`）即可。验证：`curl "<API>/song/url/match?id=185709"` 能返回 http 直链就正常。
+- **点歌给了翻唱而不是原唱**：搜索接口本身就这么排（搜「稻香」前排全是深情版/女声版，周杰伦原唱不在前 10），插件 v2.1 起默认开启「优先原唱」，读 `originSongSimpleData` 把翻唱换回原唱，必要时翻页深扫；若仍不对，直接发 `直链 <原唱歌曲ID>` 精确点歌。
+- **列表发完回复数字没反应**：v2.1 起 `排行/歌手/专辑/歌单/新歌` 列表都会登记序号缓存，回复数字即可点歌；序号有效期 60 秒，且只对发命令的本人有效（群聊里别人回复数字不会串台）。
 - **卡片能发出来但无法播放**：多为音源直链失效，可把 `音源优先级` 固定为其他音源试试。
-- **VIP 歌曲获取直链失败**：当前各镜像音源没有 VIP 曲库。要获取 VIP 歌直链需再部署 [NeteaseCloudMusicApi api-enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced) 并配置 VIP 账号 Cookie 的 `song/url/v1` 接口。
+- **原唱取不到时**：v2.1 起会自动退而求其次发一个能播的版本，并在消息里明确写「原唱 XXX 取不到直链，换成这一版」，不会让你以为拿到的是原唱。
 - **音乐卡片 / 表情回应仅 aiocqhttp 平台支持**（NapCat / Lagrange / go-cqhttp），卡片失败会自动回退；私聊贴表情在部分协议端不生效。
 
 ## 作者

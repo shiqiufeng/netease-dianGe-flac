@@ -2,7 +2,7 @@
   "unlock_api": {
     "description": "API 地址",
     "type": "string",
-    "hint": "UnblockNeteaseMusic-utils 部署地址，末尾不带 /。项目地址与部署教程：https://github.com/NeteaseCloudMusicApiEnhanced/UnblockNeteaseMusic-utils 。留空则插件不可用。",
+    "hint": "填你部署好的网易云服务地址，末尾不带 /。两种后端都支持，插件会自己识别：① 网易云 API Enhanced（推荐，自带解灰，如 https://xxx.vercel.app）；② UnblockNeteaseMusic-utils。注意解灰要连酷我/酷狗，服务部署在境外（Vercel 默认美国节点）时版权下架的歌曲（如周杰伦）会取不到。留空则插件不可用。",
     "default": "",
     "obvious_hint": true
   },
@@ -66,6 +66,12 @@
     "type": "bool",
     "hint": "开启后「点歌 关键词」直接发送搜索结果第一首；关闭则列出结果回复序号选择",
     "default": false
+  },
+  "prefer_original": {
+    "description": "优先原唱（自动跳过翻唱）",
+    "type": "bool",
+    "hint": "网易云搜索前排经常是翻唱/改编版（搜「稻香」第一条是「稻香(深情版)」，周杰伦原唱甚至不进前 10；搜「告白气球」原版被压到第 6 页）。开启后插件会按原唱标注和发行时间把翻唱换成原唱，必要时翻页深扫；想点翻唱版就在关键词里写明（如「点歌 稻香 深情版」）。",
+    "default": true
   },
   "limit": {
     "description": "搜索结果数量",
