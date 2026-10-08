@@ -2,27 +2,9 @@
   "unlock_api": {
     "description": "API 地址",
     "type": "string",
-    "hint": "填你部署的 UnblockNeteaseMusic-utils 地址（如 https://wy.example.com），末尾不带 /。插件会先请求它的 /inner/modules 认出后端并拿到音源清单，再走 /match?id=&source= 取直链（旧的 api-enhanced 也兼容）。这是**兜底**：优先用下面配的洛雪音源脚本。",
+    "hint": "填你部署的 UnblockNeteaseMusic-utils 地址（如 https://wy.example.com），末尾不带 /。插件会先请求它的 /inner/modules 认出后端并拿到音源清单，再走 /match?id=&source= 取直链（旧的 api-enhanced 也兼容）。直链全部由这个服务出，插件自己不去连任何音乐平台。",
     "default": "",
     "obvious_hint": true
-  },
-  "lx_source": {
-    "description": "洛雪音源脚本（优先用它）",
-    "type": "string",
-    "hint": "你自己那套洛雪音乐(LX Music)音源 .js 的路径：可填目录（自动取里面的 .js）或具体文件，多个用逗号分隔。插件会用 node 加载这些音源，按「歌名+歌手」查酷我 ID 后交给音源脚本换直链——音源由你的脚本出，插件不自己连音乐平台。",
-    "default": ""
-  },
-  "lx_node": {
-    "description": "node 可执行文件",
-    "type": "string",
-    "hint": "跑洛雪音源脚本用的 node，默认 node（走 PATH）。找不到就填绝对路径，如 C:\\Program Files\\nodejs\\node.exe。",
-    "default": "node"
-  },
-  "lx_quality": {
-    "description": "音源请求音质",
-    "type": "string",
-    "hint": "向音源脚本请求的音质：128k / 320k / flac / flac24bit / hires 等，看音源支持哪些；默认 320k。",
-    "default": "320k"
   },
   "proxy": {
     "description": "音源请求代理",

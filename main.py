@@ -32,6 +32,10 @@ from astrbot.core.star.filter.command import GreedyStr
 
 SELECT_TIMEOUT_SECONDS = 60
 """选歌序号的有效期（秒）"""
+MAX_BATCH_PICKS = 10
+"""一条序号消息最多点几首（防刷屏）"""
+BATCH_GAP_SECONDS = 1.5
+"""连点多首之间的间隔（秒），避免一次性糊屏"""
 ORIGINAL_SCAN_LIMIT = 15
 """搜索时额外拉取并检查的候选数量：网易云前排常被翻唱占据，原唱可能排得很后"""
 DEEP_SCAN_PAGES = 7
@@ -47,8 +51,16 @@ UNRESOLVED_COVER_HINT = (
     "要原唱可以：①「歌手 <歌手名>」看热门歌曲后回复序号；②「直链 <歌曲ID>」精确点歌。"
 )
 """确认前排全是翻唱、又定位不到原唱时的提示"""
-PICK_HINT = f"想听哪首：回复序号直接点歌（{SELECT_TIMEOUT_SECONDS} 秒内有效，回复 0 取消）"
+PICK_HINT = (
+    f"👆 回复序号点歌（{SELECT_TIMEOUT_SECONDS} 秒内有效，可连着回复多次，每次重新计时；回复 0 取消）\n"
+    f"序号写法：3｜1~3 连号｜5~7｜1-2-4-9-10 多选｜1,3,5 逗号｜单条最多 {MAX_BATCH_PICKS} 首"
+)
 """列表类命令末尾的统一提示"""
+PICK_HINT_BOARD = (
+    f"👆 回复序号看榜单曲目（{SELECT_TIMEOUT_SECONDS} 秒内有效，可连着回复多次，每次重新计时；回复 0 取消）\n"
+    f"序号写法：2｜1~3 连号｜1-2-4 多选｜单条最多 {MAX_BATCH_PICKS} 个"
+)
+"""榜单列表末尾的提示"""
 NETEASE_LEVEL = "exhigh"
 """走官方 /song/url/v1 时请求的音质（账号不支持会自动降级）"""
 ORIGINAL_SHORTLIST = 3
@@ -58,24 +70,6 @@ POPULAR_RATIO = 5
 POPULAR_MIN_COMMENTS = 20
 """评论数至少这么多才有资格当原唱，避免冷门歌乱换"""
 
-# ---------------------------------------------------------------------- #
-# 用自己的洛雪(LX Music)音源脚本取直链
-#   音源脚本只提供 musicUrl（搜索由调用方做），所以插件先用酷我按
-#   「歌名+歌手」查到歌曲 ID，再把它交给音源脚本换成可播放直链。
-# ---------------------------------------------------------------------- #
-KUWO_SEARCH_API = (
-    "http://search.kuwo.cn/r.s?&correct=1&vipver=1&stype=comprehensive&encoding=utf8"
-    "&rformat=json&mobi=1&show_copyright_off=1&searchapi=6&all={}"
-)
-KUWO_SOURCE_KEY = "kw"
-"""音源脚本里酷我的平台名"""
-DURATION_TOLERANCE_MS = 3000
-"""判定「同一个版本」的时长容差"""
-LX_DEFAULT_QUALITY = "320k"
-"""向音源脚本请求的音质"""
-LX_TIMEOUT_SECONDS = 45.0
-"""单个音源脚本的执行超时（音源要连它自己的后端，给宽一点）"""
-LX_PLATFORM_CN = {"wy": "网易云", "kw": "酷我", "kg": "酷狗", "tx": "QQ", "mg": "咪咕"}
 MATCH_FAIL_HINT = (
     "💡 音源服务取不到就发不出歌。版权下架的原唱（如周杰伦）只有靠音源服务里的"
     "跨平台音源去别家找（UnblockNeteaseMusic-utils 里是 unm）——它要连 pyncmd/bodian/qq，"
@@ -113,6 +107,10 @@ HEADERS = {
 }
 
 _ID_FROM_URL = re.compile(r"[?&]id=(\d+)")
+_PICK_SPLIT_RE = re.compile(r"[,，、;；\s\-—–/]+")
+"""序号消息的分隔符：逗号、顿号、空格、连字符（1-2-4-9-10 就靠它拆）"""
+_PICK_RANGE_RE = re.compile(r"^(\d{1,3})[~～至到](\d{1,3})$")
+"""序号区间：1~3 / 1～3 / 2到4 都当连号展开"""
 _BRACKET_RE = re.compile(r"[（(\[【《][^）)\]】》]*[）)\]】》]")
 _COVER_ASCII_RE = re.compile(r"\b(cover|remix|dj|live|ai|instrumental|karaoke)\b")
 _CJK_COVER_MARKERS = (
@@ -174,12 +172,6 @@ class NeteaseUnblockPlugin(Star):
         # AstrBotConfig 不做类型校验，空值不合法的配置一律用 or 兜底。
         self.unlock_api = (config.get("unlock_api") or "").rstrip("/")
         self.source = (config.get("source") or "").strip()
-        self.lx_source = str(config.get("lx_source") or "").strip()
-        self.lx_node = str(config.get("lx_node") or "").strip() or "node"
-        self.lx_quality = str(config.get("lx_quality") or "").strip() or LX_DEFAULT_QUALITY
-        self._lx_runtime = Path(__file__).resolve().parent / "lx_runtime.js"
-        self._lx_files: list[str] = []
-        self._lx_checked = False
         self.auto_pick = bool(config.get("auto_pick") or False)
         _po = config.get("prefer_original")
         self.prefer_original = True if _po is None else bool(_po)
@@ -199,7 +191,7 @@ class NeteaseUnblockPlugin(Star):
         _el = config.get("embed_lyrics")
         self.embed_lyrics = True if _el is None else bool(_el)
         self.send_mode = (str(config.get("send_mode") or "card")).strip().lower()
-        if self.send_mode not in ("card", "file", "text"):
+        if self.send_mode not in SEND_MODE_CN:
             self.send_mode = "card"
         try:
             self.delete_file_seconds = int(config.get("delete_file_seconds", 60))
@@ -748,172 +740,6 @@ class NeteaseUnblockPlugin(Star):
                 return item
         return None
 
-    # ------------------------------------------------------------------ #
-    # 自己的洛雪音源
-    # ------------------------------------------------------------------ #
-    def _lx_sources(self) -> list[str]:
-        """解析配置里的音源脚本路径（支持目录、多个路径、逗号/换行分隔）。
-
-        目录会展开成里面的 *.js；同一脚本可能既在目录里又被单独列出，
-        按绝对路径去重，避免同一个音源被跑两遍。
-        """
-        if self._lx_checked:
-            return self._lx_files
-        self._lx_checked = True
-        found: list[str] = []
-        seen: set[str] = set()
-
-        def _add(path: Path) -> None:
-            key = str(path.resolve())
-            if key in seen:
-                return
-            seen.add(key)
-            found.append(str(path))
-
-        raw = (self.lx_source or "").replace("，", ",").replace("\n", ",")
-        for item in raw.split(","):
-            item = item.strip().strip('"')
-            if not item:
-                continue
-            path = Path(item)
-            if path.is_dir():
-                for js in sorted(path.glob("*.js")):
-                    _add(js)
-            elif path.is_file():
-                _add(path)
-            else:
-                logger.warning(f"[netease_unblock] 音源脚本不存在: {item}")
-        self._lx_files = found
-        if found:
-            logger.info(f"[netease_unblock] 已加载 {len(found)} 个洛雪音源脚本")
-        return found
-
-    @classmethod
-    def _pick_same_version(cls, candidates: list[dict], song: dict) -> dict | None:
-        """在别家搜索结果里挑「同一个版本」的那条：同名 + 歌手对得上 + 时长一致。"""
-        want_name = cls._base_title(song.get("name") or "")
-        want_artist = re.sub(r"\s|/", "", song.get("artists") or "")
-        want_dur = int(song.get("duration") or 0)
-        want_is_cover = cls._looks_like_cover(song.get("name") or "")
-        best, best_score = None, 0
-        for cand in candidates:
-            cand_name = cand.get("name") or ""
-            if cls._base_title(cand_name) != want_name:
-                continue
-            if not want_is_cover and cls._looks_like_cover(cand_name):
-                continue
-            artist = re.sub(r"\s|/", "", cand.get("artist") or "")
-            artist_ok = bool(want_artist and artist
-                             and (want_artist in artist or artist in want_artist))
-            if want_artist and artist and not artist_ok:
-                continue
-            dur = int(cand.get("duration") or 0)
-            if want_dur and dur and abs(dur - want_dur) > DURATION_TOLERANCE_MS * 3:
-                continue
-            score = 60 + (30 if artist_ok else 0)
-            if want_dur and dur and abs(dur - want_dur) <= DURATION_TOLERANCE_MS:
-                score += 40
-            if score > best_score:
-                best, best_score = cand, score
-        return best
-
-    async def _kuwo_songid(self, song: dict) -> str | None:
-        """按「歌名 + 歌手」在酷我查出歌曲 ID，交给音源脚本用。"""
-        keyword = f"{song.get('name') or ''} {song.get('artists') or ''}".strip()
-        if not keyword:
-            return None
-        resp = await self._unlock_client.get(KUWO_SEARCH_API.format(quote(keyword)))
-        resp.raise_for_status()
-        content = (resp.json() or {}).get("content") or []
-        page = content[1] if len(content) > 1 and isinstance(content[1], dict) else {}
-        rows = []
-        for item in ((page.get("musicpage") or {}).get("abslist") or []):
-            rid = str(item.get("MUSICRID") or "").split("_")[-1]
-            if not rid.isdigit():
-                continue
-            rows.append({
-                "id": rid,
-                "name": item.get("SONGNAME") or "",
-                "artist": item.get("ARTIST") or "",
-                "duration": int(item.get("DURATION") or 0) * 1000,
-            })
-        best = self._pick_same_version(rows, song)
-        return best["id"] if best else None
-
-    async def _call_lx(self, source_file: str, payload: dict) -> str | None:
-        """跑一次音源脚本，返回它给出的直链（失败返回 None）。"""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                self.lx_node, str(self._lx_runtime), source_file,
-                json.dumps(payload, ensure_ascii=False),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-        except FileNotFoundError:
-            logger.warning(f"[netease_unblock] 找不到 node（{self.lx_node}），洛雪音源不可用")
-            return None
-        except Exception as e:
-            logger.warning(f"[netease_unblock] 启动音源脚本失败: {e!r}")
-            return None
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(),
-                                            timeout=LX_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            proc.kill()
-            logger.warning(f"[netease_unblock] 音源脚本超时: {Path(source_file).name}")
-            return None
-        text = (out or b"").decode("utf-8", "replace").strip()
-        for line in reversed(text.splitlines()):
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                data = json.loads(line)
-            except ValueError:
-                continue
-            url = data.get("url")
-            if data.get("ok") and isinstance(url, str) and url.startswith("http"):
-                return url
-            if data.get("error"):
-                logger.info(f"[netease_unblock] {Path(source_file).name}: {data['error']}")
-            return None
-        return None
-
-    async def _lx_url(self, song: dict) -> str | None:
-        """用自己的洛雪音源取直链：先查酷我歌曲 ID，再交给音源脚本换直链。"""
-        files = self._lx_sources()
-        if not files or not (song.get("name") or "").strip():
-            return None
-        try:
-            rid = await self._kuwo_songid(song)
-        except Exception as e:
-            logger.warning(f"[netease_unblock] 酷我查歌曲 ID 失败: {e!r}")
-            return None
-        if not rid:
-            logger.info(f"[netease_unblock] 酷我没查到「{song.get('name')}」，跳过洛雪音源")
-            return None
-        payload = {
-            "source": KUWO_SOURCE_KEY,
-            "quality": self.lx_quality,
-            "musicInfo": {
-                "songmid": rid, "rid": rid, "id": rid, "hash": rid,
-                "name": song.get("name") or "",
-                "singer": song.get("artists") or "",
-                "albumName": song.get("album") or "",
-                "interval": "",
-            },
-        }
-        for source_file in files:
-            url = await self._call_lx(source_file, payload)
-            if not url:
-                continue
-            if self.verify_audio and not await self._is_audio(url):
-                logger.info(f"[netease_unblock] {Path(source_file).name} 返回的不是音频，换下一个")
-                continue
-            logger.info(f"[netease_unblock] 洛雪音源 {Path(source_file).name} 取到直链")
-            return url
-        return None
-
     async def _is_audio(self, url: str) -> bool:
         try:
             resp = await self._unlock_client.head(url)
@@ -954,23 +780,18 @@ class NeteaseUnblockPlugin(Star):
                                mode: str | None = None):
         """获取直链并构造发送结果（异步生成器）：按指定/默认模式发卡片 / 文件 / 语音 / 文本。
 
-        直链优先问**自己的洛雪音源脚本**（配置 `lx_source` 指向的 .js），
-        取不到再回落到 `unlock_api` 音源服务；两边都没有才报错，不换别的版本充数。
+        直链只问 `unlock_api` 音源服务（UnblockNeteaseMusic-utils 的 /match，
+        旧的 api-enhanced 也兼容）；取不到就报错，不换别的版本充数。
         """
         mode = mode or self.send_mode
         link = SONG_LINK.format(song["id"])
         audio = None
         try:
-            audio = await self._lx_url(song)  # 先用你自己的洛雪音源
+            audio = await self._match(song["id"])
         except Exception as e:
-            logger.warning(f"[netease_unblock] 洛雪音源异常: {e!r}")
-        if not audio:
-            try:
-                audio = await self._match(song["id"])  # 再用音源服务兜底
-            except Exception as e:
-                hint = "（已配置代理，请确认代理进程存活）" if self.proxy else "（可尝试在插件配置里填写本机代理）"
-                logger.error(f"[netease_unblock] 音源请求异常: {e!r} {hint}")
-                audio = None
+            hint = "（已配置代理，请确认代理进程存活）" if self.proxy else "（可尝试在插件配置里填写本机代理）"
+            logger.error(f"[netease_unblock] 音源请求异常: {e!r} {hint}")
+            audio = None
 
         if not audio:
             api = self.unlock_api or "（未配置 API 地址）"
@@ -1343,6 +1164,134 @@ class NeteaseUnblockPlugin(Star):
             "mode": mode,
         }
 
+    @staticmethod
+    def _parse_picks(text: str) -> tuple[list[int], list[int], bool] | None:
+        """把一条序号消息解析成（要点的序号，越界/非法项，是否被截断）。
+
+        支持：
+        - 单个：``3``
+        - 连号：``1~3`` / ``1～3`` / ``2到4`` → 1,2,3（过长则截断并标记）
+        - 多选：``1-2-4-9-10`` / ``1,3,5`` / ``1 4 7`` / ``1、2``
+        返回 None 表示这条消息根本不是序号（交给别的插件/LLM）。
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        tokens = [t for t in _PICK_SPLIT_RE.split(raw) if t]
+        if not tokens:
+            return None
+        picked: list[int] = []
+        bad: list[int] = []
+        truncated = False
+        for tok in tokens:
+            m = _PICK_RANGE_RE.match(tok)
+            if m:
+                a, b = int(m.group(1)), int(m.group(2))
+                if a > b:
+                    a, b = b, a
+                for i in range(a, b + 1):
+                    if len(picked) >= MAX_BATCH_PICKS:
+                        truncated = True
+                        break
+                    picked.append(i)
+                continue
+            if not tok.isdigit():
+                return None  # 含非序号字符，整条不当序号处理
+            picked.append(int(tok))
+        if not picked:
+            return None
+        if len(picked) > MAX_BATCH_PICKS:
+            picked = picked[:MAX_BATCH_PICKS]
+            truncated = True
+        return picked, bad, truncated
+
+    async def _play_picks(self, event: AstrMessageEvent, songs: list[dict],
+                          picks: list[int], mode: str | None = None,
+                          bad: list[int] | None = None, truncated: bool = False):
+        """按序号依次点歌（可多首），逐首播报进度；单首失败不中断后面的。"""
+        total = len(songs)
+        targets = [p for p in picks if 1 <= p <= total]
+        out_of_range = [p for p in picks if not (1 <= p <= total)]
+        if bad:
+            out_of_range = bad + out_of_range
+        if not targets:
+            if out_of_range:
+                r = await self._say(
+                    event,
+                    f"❌ 序号超出范围，本列表共 {total} 首：{'、'.join(str(x) for x in dict.fromkeys(out_of_range))}",
+                )
+                if r is not None:
+                    yield r
+            return
+        if truncated:
+            r = await self._say(event, f"⚠️ 单条最多点 {MAX_BATCH_PICKS} 首，已按前 {MAX_BATCH_PICKS} 个序号处理")
+            if r is not None:
+                yield r
+        if len(targets) > 1:
+            r = await self._say(
+                event,
+                f"🎧 按序号连点 {len(targets)} 首：{'、'.join(str(x) for x in targets)}",
+            )
+            if r is not None:
+                yield r
+        ok = 0
+        for i, idx in enumerate(targets, 1):
+            song = songs[idx - 1]
+            if len(targets) > 1:
+                r = await self._say(
+                    event, f"▶️ {i}/{len(targets)}：{song['name']} - {song['artists'] or '未知歌手'}"
+                )
+                if r is not None:
+                    yield r
+            try:
+                async for r in self._resolve_results(event, song, mode):
+                    yield r
+                ok += 1
+            except Exception as e:
+                logger.warning(f"[netease_unblock] 序号 {idx} 点歌失败: {e!r}")
+            if i < len(targets):
+                await asyncio.sleep(BATCH_GAP_SECONDS)
+        if len(targets) > 1:
+            r = await self._say(event, f"✅ 本次点歌完成（成功 {ok}/{len(targets)}）")
+            if r is not None:
+                yield r
+        if out_of_range:
+            r = await self._say(
+                event,
+                f"⚠️ 已跳过超出范围的序号：{'、'.join(str(x) for x in dict.fromkeys(out_of_range))}（共 {total} 首）",
+            )
+            if r is not None:
+                yield r
+
+    async def _play_board_picks(self, event: AstrMessageEvent, boards: list[dict],
+                                picks: list[int], bad: list[int] | None = None):
+        """按序号依次展开榜单（支持 1~3 多选），最后一个榜单的曲目列表留在缓存里。"""
+        total = len(boards)
+        targets = [p for p in picks if 1 <= p <= total]
+        out_of_range = [p for p in picks if not (1 <= p <= total)] + list(bad or [])
+        if not targets:
+            if out_of_range:
+                r = await self._say(
+                    event,
+                    f"❌ 序号超出范围，榜单共 {total} 个：{'、'.join(str(x) for x in dict.fromkeys(out_of_range))}",
+                )
+                if r is not None:
+                    yield r
+            return
+        last = targets[-1]
+        for idx in targets:
+            async for r in self._toplist_flow(event, boards[idx - 1].get("name") or ""):
+                yield r
+            if idx != last:
+                await asyncio.sleep(BATCH_GAP_SECONDS)
+        if out_of_range:
+            r = await self._say(
+                event,
+                f"⚠️ 已跳过超出范围的序号：{'、'.join(str(x) for x in dict.fromkeys(out_of_range))}（共 {total} 个）",
+            )
+            if r is not None:
+                yield r
+
     async def _lyrics_flow(self, event: AstrMessageEvent, text: str):
         await self._react(event)  # 命令回执
         if not text:
@@ -1388,6 +1337,7 @@ class NeteaseUnblockPlugin(Star):
                 "boards": [{"id": b.get("id"), "name": b.get("name")} for b in shown],
                 "ts": time.time(),
             }
+            lines.append(PICK_HINT_BOARD)
             r = await self._say(event, "\n".join(lines))
             if r is not None:
                 yield r
@@ -1605,25 +1555,49 @@ class NeteaseUnblockPlugin(Star):
             yield r
 
     async def _serial_flow(self, event: AstrMessageEvent, arg: str):
-        """连播当前点歌列表：按语音顺序发送，最多 10 首（防刷屏）。"""
+        """连播当前点歌列表：按语音顺序发送，最多 10 首（防刷屏）。
+
+        裸数字按「前 N 首」处理（``连播 5``）；
+        带连号/多选符才按序号（``连播 1~3``、``连播 1-3-5``）。
+        """
         key = self._cache_key(event)
         pending = self._pending.get(key)
         if not pending or pending.get("stage") != "pick_song" or not pending.get("songs"):
-            r = await self._say(event, "❌ 没有待连播的列表，先「点歌 关键词」搜索一次再用连播")
+            r = await self._say(
+                event,
+                "❌ 没有待连播的列表，先「点歌 关键词」或「歌手/专辑/歌单」出一个列表\n"
+                "用法：连播 [首数]（如：连播 5）｜连播 1~3｜连播 1-3-5",
+            )
             if r is not None:
                 yield r
             return
-        try:
-            n = int(arg) if arg else 5
-        except (TypeError, ValueError):
-            n = 5
-        n = max(1, min(n, 10))
-        songs = pending["songs"][:n]
-        self._pending.pop(key, None)
+        songs = pending["songs"]
+        total = len(songs)
+        raw = (arg or "").strip()
+        plain = raw.isdigit()  # 光一个数字 = 首数
+        picks: list[int] = []
+        if not plain:
+            parsed = self._parse_picks(raw) if raw else None
+            if parsed and any(1 <= p <= total for p in parsed[0]):
+                picks = [p for p in parsed[0] if 1 <= p <= total]
+        if not picks:
+            try:
+                n = int(raw) if raw.isdigit() else 5
+            except (TypeError, ValueError):
+                n = 5
+            picks = list(range(1, max(1, min(n, MAX_BATCH_PICKS, total)) + 1))
+        picks = [p for p in dict.fromkeys(picks) if 1 <= p <= total][:MAX_BATCH_PICKS]
+        if not picks:
+            r = await self._say(event, f"❌ 没有可连播的序号，本列表共 {total} 首")
+            if r is not None:
+                yield r
+            return
+        targets = [songs[p - 1] for p in picks]
+        pending["ts"] = time.time()  # 连播后列表仍保留，可继续回复序号
         await self._react(event)
         ok = 0
-        for i, song in enumerate(songs, 1):
-            r = await self._say(event, f"▶️ 连播 {i}/{len(songs)}：{song['name']} - {song['artists'] or '未知歌手'}")
+        for i, song in enumerate(targets, 1):
+            r = await self._say(event, f"▶️ 连播 {i}/{len(targets)}：{song['name']} - {song['artists'] or '未知歌手'}")
             if r is not None:
                 yield r
             try:
@@ -1632,8 +1606,9 @@ class NeteaseUnblockPlugin(Star):
                 ok += 1
             except Exception as e:
                 logger.warning(f"[netease_unblock] 连播第 {i} 首失败: {e!r}")
-            await asyncio.sleep(2)
-        r = await self._say(event, f"✅ 连播结束（成功 {ok}/{len(songs)}）")
+            if i < len(targets):
+                await asyncio.sleep(BATCH_GAP_SECONDS)
+        r = await self._say(event, f"✅ 连播结束（成功 {ok}/{len(targets)}）")
         if r is not None:
             yield r
 
@@ -1660,13 +1635,21 @@ class NeteaseUnblockPlugin(Star):
         key = self._cache_key(event)
         pending = self._pending.get(key)
 
-        # 「点歌 2」：序号选择上一次的搜索结果
-        if kw.isdigit() and pending and pending["stage"] == "pick_song":
-            songs = pending["songs"]
-            idx = int(kw)
-            if 1 <= idx <= len(songs):
+        # 「点歌 2」「点歌 1~3」「点歌 1-2-4」：序号选择上一次的列表（不销毁列表，可继续点）
+        parsed = self._parse_picks(kw) if pending and pending["stage"] == "pick_song" else None
+        if parsed:
+            picks, bad, truncated = parsed
+            if picks == [0]:
                 self._pending.pop(key, None)
-                async for r in self._resolve_results(event, songs[idx - 1], pending.get("mode")):
+                r = await self._say(event, "已取消选歌")
+                if r is not None:
+                    yield r
+                event.stop_event()
+                return
+            if any(1 <= p <= len(pending["songs"]) for p in picks):
+                pending["ts"] = time.time()
+                async for r in self._play_picks(event, pending["songs"], picks,
+                                                pending.get("mode"), bad, truncated):
                     yield r
                 event.stop_event()
                 return
@@ -1704,7 +1687,7 @@ class NeteaseUnblockPlugin(Star):
             lines.append(f"{i}. {self._fmt(song)}")
         if getattr(songs, "unresolved_covers", False):
             lines.append(UNRESOLVED_COVER_HINT)
-        lines.append(f"回复序号选择（{SELECT_TIMEOUT_SECONDS} 秒内有效，回复 0 取消）")
+        lines.append(PICK_HINT)
         self._pending[key] = {"stage": "pick_song", "songs": songs, "ts": time.time(), "mode": mode}
 
         text = "\n".join(lines)
@@ -1793,14 +1776,14 @@ class NeteaseUnblockPlugin(Star):
         }
         if not m:
             r = await self._say(event, 
-                f"当前发送模式：{SEND_MODE_CN[self.send_mode]}（发送「点歌模式 卡片/文件/文本」可切换）"
+                f"当前发送模式：{SEND_MODE_CN[self.send_mode]}（发送「点歌模式 卡片/文件/文本/语音」可切换）"
             )
             if r is not None:
                 yield r
             return
         target = alias.get(m)
         if not target:
-            r = await self._say(event, "未知模式，可选：卡片 / 文件 / 文本")
+            r = await self._say(event, "未知模式，可选：卡片 / 文件 / 文本 / 语音")
             if r is not None:
                 yield r
             return
@@ -1824,50 +1807,62 @@ class NeteaseUnblockPlugin(Star):
     async def _help_flow(self, event: AstrMessageEvent):
         await self._react(event)  # 命令回执
         mode = self.send_mode
-        tips = (
-            "🎵 网易云音乐点歌-flac v2.6.0\n"
-            "══════════════════\n"
-            "📖 命令（加不加 / 前缀均可）\n"
-            "点歌 <歌名>　　　搜索歌曲，回复序号选择\n"
-            "点歌 <序号>　　　直接选择上一次结果\n"
-            "点歌卡片 <歌名>　以音乐卡片发送\n"
-            "点歌文件 <歌名>　以音乐文件发送\n"
-            "点歌语音 <歌名>　以语音发送\n"
-            "点歌消息 <歌名>　以文本链接发送\n"
-            "直链 <ID/链接>　按 ID 或分享链接获取直链\n"
-            "点歌模式 [模式]　查看/切换默认发送方式\n"
-            "帮助　　　　　　查看本帮助\n"
-            "══════════════════\n"
-            "🌐 发现音乐\n"
-            "歌词 <歌名|ID>　查看歌词\n"
-            "排行 [榜单名]　官方排行榜\n"
-            "歌手 <名字>　　热门歌曲\n"
-            "专辑 <名字>　　专辑曲目\n"
-            "歌单 <关键词>　歌单曲目\n"
-            "评论 <歌名|ID>　歌曲热评\n"
-            "新歌 [地区]　　新歌速递(华语/欧美/日本/韩国)\n"
-            "来首歌　　　　　随机来一首\n"
-            "连播 [数量]　　连播当前列表(语音,≤10)\n"
-            "（上面这些列表都能直接回复序号点歌）\n"
-            "══════════════════\n"
-            "💡 示例\n"
-            "点歌 咏春\n"
-            "点歌文件 咏春\n"
-            "点歌语音 咏春\n"
-            "直链 1498523311\n"
-            "点歌模式 文件\n"
-            "歌词 晴天\n"
-            "排行\n"
-            "歌手 周杰伦\n"
-            "评论 晴天\n"
-            "══════════════════\n"
-            f"⚙️ 默认发送：{SEND_MODE_CN.get(mode, mode)}"
-            + ("（卡片被拒自动回退）\n" if mode == "card" else "\n")
-            + f"🕒 列表 {self.retract_seconds} 秒自动撤回｜免前缀：{'开启' if not self.require_prefix else '关闭'}\n"
-            "══════════════════\n"
-            "👥 作者\n"
-            "流水 · 听雨的蛙 · 落雪 · GLM-5.3-Flash"
-        )
+        tips = "\n".join([
+            "🎵 网易云音乐点歌-flac v2.7.0",
+            "",
+            "【点歌】",
+            "  点歌 <歌名> ········· 搜索歌曲，出列表后回复序号",
+            "  点歌 <序号> ········· 直接选上一次列表（支持 1~3 / 1-2-4）",
+            "  点歌卡片 <歌名> ····· 以音乐卡片发送",
+            "  点歌文件 <歌名> ····· 以音乐文件发送",
+            "  点歌语音 <歌名> ····· 以语音条发送",
+            "  点歌消息 <歌名> ····· 以文本链接发送",
+            "  直链 <ID/链接> ······ 按网易云 ID 或分享链接取直链",
+            "  点歌模式 [模式] ····· 查看/切换默认发送方式",
+            "  连播 [首数|序号] ···· 连播当前列表（语音，≤10）",
+            "  帮助 ··············· 本帮助",
+            "",
+            "【找歌】",
+            "  歌词 <歌名|ID> ······ 歌曲歌词",
+            "  排行 [榜单名] ······· 官方排行榜（回复序号看曲目）",
+            "  歌手 <名字> ········· 该歌手热门歌曲",
+            "  专辑 <名字> ········· 专辑曲目",
+            "  歌单 <关键词> ······· 歌单曲目",
+            "  评论 <歌名|ID> ······ 歌曲热评",
+            "  新歌 [地区] ········· 新歌速递：华语/欧美/日本/韩国/全部",
+            "  来首歌 ·············· 随机一首",
+            "",
+            "【序号怎么回】",
+            f"  列表 {SELECT_TIMEOUT_SECONDS} 秒内有效，可以连着回复多次，每次回复都会重新计时",
+            "  3 ········· 单首，就发第 3 首",
+            "  1~3 ······· 连号，发第 1、2、3 首（~ ～ 到 都可以）",
+            "  5~7 ······· 发第 5、6、7 首",
+            "  1~10 ······ 发第 1 到 10 首",
+            "  1-2-4-9-10 · 多选，就发第 1、2、4、9、10 首",
+            "  1,3,5 ····· 逗号多选，同 1-3-5",
+            "  1 4 7 ····· 空格分隔，同 1-4-7",
+            "  0 ········· 取消本次选歌",
+            f"  单条最多 {MAX_BATCH_PICKS} 首；点歌/排行/歌手/专辑/歌单/新歌 的列表都支持",
+            "",
+            "【示例】",
+            "  点歌 咏春              → 出 10 首列表",
+            "  3                     → 发第 3 首（列表还有效，可继续发 1）",
+            "  1~3                   → 连着发第 1、2、3 首",
+            "  1-2-4-9-10            → 发这 5 首",
+            "  点歌文件 咏春          → 直接发文件，不出列表",
+            "  歌手 周杰伦 → 1~5      → 周杰伦热门前 5 首",
+            "  排行 → 2 → 1~5        → 第 2 个榜单的前 5 首",
+            "  直链 1498523311        → 按 ID 取直链",
+            "  点歌模式 文件           → 之后默认发文件",
+            "",
+            "【当前状态】",
+            f"  默认发送：{SEND_MODE_CN.get(mode, mode)}"
+            + ("（卡片被拒自动回退文本）" if mode == "card" else ""),
+            f"  列表 {self.retract_seconds} 秒自动撤回｜免前缀：{'开启' if not self.require_prefix else '关闭'}",
+            "  直链来源：UnblockNeteaseMusic-utils 音源服务（版权下架的歌靠它）",
+            "",
+            "【作者】流水 · 听雨的蛙 · 落雪 · GLM-5.3-Flash",
+        ])
         r = await self._say(event, tips)
         if r is not None:
             yield r
@@ -1996,7 +1991,7 @@ class NeteaseUnblockPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_selection(self, event: AstrMessageEvent):
-        """处理选歌的纯数字回复（仅对发起点歌的用户生效，非序号消息不拦截）。"""
+        """处理选歌的序号回复：支持 3 / 1~3 / 1-2-4-9-10 / 1,3,5，60 秒内可反复点歌。"""
         now = time.time()
         if self._pending:
             expired = [
@@ -2011,9 +2006,11 @@ class NeteaseUnblockPlugin(Star):
             return
 
         text = event.message_str.strip()
-        if not text.isdigit():
+        parsed = self._parse_picks(text)
+        if parsed is None:
             # 非序号消息不拦截，放行给其他插件 / LLM
             return
+        picks, bad, truncated = parsed
 
         if now - cache["ts"] > SELECT_TIMEOUT_SECONDS:
             self._pending.pop(key, None)
@@ -2023,33 +2020,28 @@ class NeteaseUnblockPlugin(Star):
             event.stop_event()
             return
 
-        idx = int(text)
-        if idx == 0:
+        if picks == [0]:
             self._pending.pop(key, None)
             r = await self._say(event, "已取消选歌")
             if r is not None:
                 yield r
             event.stop_event()
             return
+        if 0 in picks:
+            picks = [p for p in picks if p != 0]
+
+        # 点歌后不销毁缓存，只刷新时间戳：同一张列表在有效期内可以随便接着点
+        cache["ts"] = now
+        await self._react(event)  # 选中序号同样贴表情回执
 
         # 「排行」列表：数字选的是榜单，进去看曲目
         if cache.get("stage") == "pick_board":
-            boards = cache.get("boards") or []
-            if not (1 <= idx <= len(boards)):
-                return  # 超出范围的数字视为普通聊天，不拦截
-            self._pending.pop(key, None)
-            await self._react(event)
-            async for r in self._toplist_flow(event, boards[idx - 1].get("name") or ""):
+            async for r in self._play_board_picks(event, cache.get("boards") or [], picks, bad):
                 yield r
             event.stop_event()
             return
 
-        songs = cache["songs"]
-        if not (1 <= idx <= len(songs)):
-            return  # 超出范围的数字视为普通聊天，不拦截
-
-        self._pending.pop(key, None)  # 进入执行即销毁，防止重复触发
-        await self._react(event)  # 选中序号同样贴表情回执
-        async for r in self._resolve_results(event, songs[idx - 1], cache.get("mode")):
+        async for r in self._play_picks(event, cache.get("songs") or [], picks, cache.get("mode"), bad, truncated):
             yield r
+        event.stop_event()
         event.stop_event()
