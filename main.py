@@ -9,6 +9,7 @@
 
 import asyncio
 import hashlib
+import json
 import os
 import random
 import re
@@ -49,8 +50,6 @@ UNRESOLVED_COVER_HINT = (
 """确认前排全是翻唱、又定位不到原唱时的提示"""
 PICK_HINT = f"想听哪首：回复序号直接点歌（{SELECT_TIMEOUT_SECONDS} 秒内有效，回复 0 取消）"
 """列表类命令末尾的统一提示"""
-FALLBACK_TRY_LIMIT = 5
-"""原唱取不到直链时，最多再试几个同名版本（取到别的版本会明确提示用户）"""
 NETEASE_LEVEL = "exhigh"
 """走官方 /song/url/v1 时请求的音质（账号不支持会自动降级）"""
 
@@ -71,13 +70,24 @@ KUGOU_TRACK_API = (
     "http://trackercdn.kugou.com/i/v2/?key={key}&hash={hash}"
     "&appid=1005&pid=2&cmd=25&behavior=play&album_id={album}"
 )
+QQ_API = "https://u.y.qq.com/cgi-bin/musicu.fcg"
+QQ_HEADERS = {"origin": "http://y.qq.com/", "referer": "http://y.qq.com/"}
+QQ_FLAC_FORMATS = (("F000", ".flac"), ("M800", ".mp3"), ("M500", ".mp3"))
+QQ_FREE_FORMATS = ((None, None),)
+"""QQ 无 Cookie 时只能按默认码率取（filename 传 null）"""
 UA_OKHTTP = {"user-agent": "okhttp/3.10.0"}
 _URL_RE = re.compile(r"""http[^\s$"']+""")
-PLATFORM_CN = {"kuwo": "酷我", "kugou": "酷狗"}
-CROSS_PLATFORM_DEFAULT = "kuwo,kugou"
-"""网易云取不到时，按顺序去哪些平台找同一首原唱；留空字符串关闭"""
+PLATFORM_CN = {"qq": "QQ音乐", "kuwo": "酷我", "kugou": "酷狗"}
+MUSIC_SOURCE_DEFAULT = "qq,kugou,kuwo"
+"""网易云取不到时，按顺序去哪些平台找同一首原唱（默认 QQ音乐优先）；留空关闭"""
 DURATION_TOLERANCE_MS = 3000
 """跨平台匹配时认为「同一个版本」的时长容差"""
+ORIGINAL_SHORTLIST = 3
+"""深扫最多留几个同名候选去比评论数"""
+POPULAR_RATIO = 5
+"""评论数高出这么多倍才认定是原唱（原唱通常比翻唱高几个数量级）"""
+POPULAR_MIN_COMMENTS = 20
+"""评论数至少这么多才有资格当原唱，避免冷门歌乱换"""
 MATCH_FAIL_HINT = (
     "💡 音源服务取不到就发不出歌。版权下架的原唱只有跨平台音源能取，"
     "服务若部署在境外（如 Vercel 默认美国节点）会连不上酷我——"
@@ -179,9 +189,11 @@ class NeteaseUnblockPlugin(Star):
         self.auto_pick = bool(config.get("auto_pick") or False)
         _po = config.get("prefer_original")
         self.prefer_original = True if _po is None else bool(_po)
-        _cp = config.get("cross_platform")
-        self.cross_platform = (CROSS_PLATFORM_DEFAULT if _cp is None
-                               else str(_cp).strip())
+        _cp = config.get("music_source")
+        if _cp is None:
+            _cp = config.get("cross_platform")  # 兼容 v2.3 的旧配置名
+        self.music_source = (MUSIC_SOURCE_DEFAULT if _cp is None else str(_cp).strip())
+        self.qq_cookie = str(config.get("qq_cookie") or "").strip()
         self.limit = self._safe_int(config.get("limit"), 10)
         self.timeout = self._safe_float(config.get("timeout"), 15.0)
         self.proxy = (config.get("proxy") or "").strip()
@@ -350,17 +362,45 @@ class NeteaseUnblockPlugin(Star):
             return {}
         return {s.get("id"): s for s in songs if s.get("id")}
 
-    async def _find_original_deep(self, keyword: str, older_than: int = 0) -> dict | None:
-        """翻页深扫，找「干净同名 + 发行最早」的那条作为原唱。
+    async def _comments_total(self, song_id) -> int:
+        """歌曲评论数——判定「哪个版本才是原唱」最灵的指标。取不到按 0 算。"""
+        data = await self._api_get(COMMENTS_API.format(sid=song_id), {"limit": 1})
+        try:
+            return int((data or {}).get("total") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    async def _pick_most_popular(self, songs: list[dict], base: dict | None) -> dict | None:
+        """在候选里挑评论数最高的当原唱，但必须**明显**高于当前第一条才换。
+
+        原唱的评论数通常比翻唱高几个数量级（实测「告白气球」周杰伦 349102 条
+        vs 翻唱 105 条），比单看发行时间可靠；差距不够大就不动，避免冷门歌乱换。
+        """
+        base_n = await self._comments_total(base["id"]) if base else 0
+        best, best_n = None, 0
+        for song in songs[:ORIGINAL_SHORTLIST]:
+            if base and song["id"] == base["id"]:
+                continue
+            n = await self._comments_total(song["id"])
+            if n > best_n:
+                best, best_n = song, n
+        if best is None:
+            return None
+        if best_n < POPULAR_MIN_COMMENTS or best_n < base_n * POPULAR_RATIO:
+            return None
+        logger.info(f"[netease_unblock] 按评论数认定原唱: {best['name']} - {best['artists']}"
+                    f"（{best_n} 条 vs {base_n} 条）")
+        return best
+
+    async def _find_original_deep(self, keyword: str) -> list[dict]:
+        """翻页深扫，返回「干净同名」的候选（按专辑发行时间由早到晚，最多几个）。
 
         网易云会把原唱压到很后面：「告白气球」的周杰伦原版在第 6 页，前 50 条里
-        45 条是翻唱。而且 originCoverType=1 并不等于原唱（大量改编版也是 1），
-        所以判据用「曲名没有括号后缀 + 专辑发行时间最早」——翻唱必然晚于原唱。
-        只返回比 older_than 更早的条目，避免把原本就对的第一条挤下去。
+        45 条是翻唱。判据是「曲名没有括号后缀」（带括号的几乎都是翻唱/改编/现场），
+        再结合发行时间与评论数定夺。
         """
         target = self._base_title(keyword)
-        best: dict | None = None
-        best_ts = 0
+        found: dict = {}
         seen: set = set()
         for page in range(DEEP_SCAN_PAGES):
             if page:
@@ -382,21 +422,20 @@ class NeteaseUnblockPlugin(Star):
                     continue
                 seen.add(row.get("id"))
                 name = row.get("name") or ""
-                # 只看「光秃秃的同名」条目：带括号后缀的几乎都是翻唱/改编/现场版
                 if _BRACKET_RE.search(name) or self._base_title(name) != target:
                     continue
                 ts = ((row.get("album") or {}).get("publishTime")
                       or row.get("publishTime") or 0)
-                if not ts or (older_than and ts >= older_than):
+                if not ts:
                     continue
-                if best is None or ts < best_ts:
-                    best, best_ts = row, ts
+                found[row["id"]] = (ts, row)
             if len(rows) < DEEP_SCAN_PAGE_SIZE:
                 break
-        if best is None:
-            return None
-        logger.info(f"[netease_unblock] 深扫定位到更早的同名版本: {best.get('name')} id={best.get('id')}")
-        return self._normalize(best)
+        ranked = [row for _, row in sorted(found.values(), key=lambda kv: kv[0])]
+        if ranked:
+            logger.info(f"[netease_unblock] 深扫拿到 {len(ranked)} 个同名候选，"
+                        f"最早: {ranked[0].get('name')} id={ranked[0].get('id')}")
+        return [self._normalize(row) for row in ranked[:ORIGINAL_SHORTLIST]]
 
     async def _promote_originals(self, keyword: str, songs: list[dict]) -> tuple[list[dict], bool]:
         """把前排翻唱替换成原唱，返回 (结果列表, 是否「全是翻唱且没找到原唱」)。
@@ -458,13 +497,20 @@ class NeteaseUnblockPlugin(Star):
         top_id = top["id"] if top else None
         # 前排没找到原唱，且这个曲名下翻唱扎堆 → 原唱多半被压到了后面，翻页深扫一次。
         # （「告白气球」的原版在第 6 页；前排还混着未标注的重录版，
-        #   而 originCoverType=1 也不可信，所以只能靠发行时间判断）
-        deep = await self._find_original_deep(
-            keyword, older_than=(top or {}).get("publish") or 0
-        )
-        if deep:
+        #   而 originCoverType=1 也不可信）
+        deep_list = await self._find_original_deep(keyword)
+        if not deep_list:
+            return rest, top_id in covers
+
+        # 判据一：评论数。原唱通常比翻唱高几个数量级，这个最准。
+        popular = await self._pick_most_popular([top] + deep_list if top else deep_list, top)
+        if popular:
+            return [popular] + [s for s in rest if s["id"] != popular["id"]], False
+
+        # 判据二：发行时间。评论数持平（或拿不到）时，用「更早发行的同名版本」兜底。
+        deep = deep_list[0]
+        if top is None or (deep.get("publish") or 0) < (top.get("publish") or 0):
             return [deep] + [s for s in rest if s["id"] != deep["id"]], False
-        # 深扫也没找到更早的同名版本：只有第一条被确认是翻唱时才提示用户
         return rest, top_id in covers
 
     # ------------------------------------------------------------------ #
@@ -623,50 +669,61 @@ class NeteaseUnblockPlugin(Star):
     # 跨平台找原唱（网易云版权下架的歌，去酷我/酷狗拿同一首）
     # ------------------------------------------------------------------ #
     @classmethod
-    def _pick_best(cls, candidates: list[dict], song: dict) -> dict | None:
-        """在别家的搜索结果里挑出跟网易云这首「同一个版本」的那条。
+    def _rank_candidates(cls, candidates: list[dict], song: dict) -> list[dict]:
+        """给别家的搜索结果打分排序，只保留「同一个版本」的。
 
-        判据：曲名必须干净同名（去掉括号注释），歌手对得上，时长越接近越好
-        （时长一致基本就是同一录音，能避开 Live / 翻唱 / 加速版）。
+        判据：曲名去括号后必须同名、歌手对得上、**时长接近**（同一录音），
+        带翻唱/现场标记的直接排除——除非用户自己点名的就是那个版本。
+        返回按可信度从高到低排好的列表，供逐个尝试取直链。
         """
         want_name = cls._base_title(song.get("name") or "")
         want_artist = re.sub(r"\s|/", "", song.get("artists") or "")
         want_dur = int(song.get("duration") or 0)
-        best: dict | None = None
-        best_score = 0
+        want_is_cover = cls._looks_like_cover(song.get("name") or "")
+        scored = []
         for cand in candidates:
-            if cls._base_title(cand.get("name") or "") != want_name:
+            cand_name = cand.get("name") or ""
+            if cls._base_title(cand_name) != want_name:
                 continue  # 曲名对不上直接丢，宁缺毋滥
-            score = 60
+            if not want_is_cover and cls._looks_like_cover(cand_name):
+                continue  # 别家的 Live/翻唱不要，原唱才是目标
             artist = re.sub(r"\s|/", "", cand.get("artist") or "")
-            if want_artist and artist and (want_artist in artist or artist in want_artist):
-                score += 30
+            artist_ok = bool(want_artist and artist
+                             and (want_artist in artist or artist in want_artist))
+            if want_artist and artist and not artist_ok:
+                continue  # 歌手对不上
             dur = int(cand.get("duration") or 0)
-            if want_dur and dur:
-                diff = abs(dur - want_dur)
-                if diff <= DURATION_TOLERANCE_MS:
-                    score += 40
-                elif diff <= DURATION_TOLERANCE_MS * 3:
-                    score += 15
-            if cls._looks_like_cover(cand.get("name") or ""):
-                score -= 50
-            if score > best_score:
-                best, best_score = cand, score
-        return best
+            if want_dur and dur and abs(dur - want_dur) > DURATION_TOLERANCE_MS * 3:
+                continue  # 时长差太多 = 不是同一个版本
+            score = 60
+            if artist_ok:
+                score += 30
+            if want_dur and dur and abs(dur - want_dur) <= DURATION_TOLERANCE_MS:
+                score += 40
+            scored.append((score, cand))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [cand for _, cand in scored]
+
+    @classmethod
+    def _pick_best(cls, candidates: list[dict], song: dict) -> dict | None:
+        """取可信度最高的那一条（没有合适的返回 None）。"""
+        ranked = cls._rank_candidates(candidates, song)
+        return ranked[0] if ranked else None
 
     async def _other_platform_url(self, song: dict) -> tuple[str, str] | None:
-        """网易云取不到时，去酷我/酷狗按「歌名 + 歌手」找同一首原唱。
+        """网易云取不到时，按配置的顺序去别家找**同一首原唱**。
 
         返回 (直链, 平台名)。这几家是自己的曲库，周杰伦这类在网易云下架的歌
-        在酷我/酷狗反而是完整原版。
+        在 QQ音乐/酷狗/酷我反而是完整原版。
         """
         name = (song.get("name") or "").strip()
         if not name:
             return None
         keyword = f"{name} {song.get('artists') or ''}".strip()
-        for key in (self.cross_platform or "").split(","):
+        for key in (self.music_source or "").split(","):
             key = key.strip().lower()
-            finder = {"kuwo": self._kuwo_url, "kugou": self._kugou_url}.get(key)
+            finder = {"qq": self._qq_url, "kuwo": self._kuwo_url,
+                      "kugou": self._kugou_url}.get(key)
             if not finder:
                 continue
             try:
@@ -683,6 +740,71 @@ class NeteaseUnblockPlugin(Star):
             return url, PLATFORM_CN.get(key, key)
         return None
 
+    # -------------------------- QQ 音乐 -------------------------- #
+    @staticmethod
+    def _qq_url_of(payload: dict) -> str:
+        return QQ_API + "?data=" + quote(json.dumps(payload, ensure_ascii=False))
+
+    def _qq_headers(self) -> dict:
+        headers = dict(QQ_HEADERS)
+        if self.qq_cookie:
+            headers["cookie"] = self.qq_cookie
+        return headers
+
+    def _qq_formats(self):
+        """有 Cookie 才可能吃到无损；没有就只能按默认码率要。"""
+        return QQ_FLAC_FORMATS if self.qq_cookie else QQ_FREE_FORMATS
+
+    async def _qq_url(self, keyword: str, song: dict) -> str | None:
+        payload = {"search": {
+            "method": "DoSearchForQQMusicDesktop",
+            "module": "music.search.SearchCgiService",
+            "param": {"num_per_page": 10, "page_num": 1,
+                      "query": keyword, "search_type": 0},
+        }}
+        resp = await self._unlock_client.get(self._qq_url_of(payload), headers=self._qq_headers())
+        resp.raise_for_status()
+        body = resp.json() or {}
+        songs = ((((body.get("search") or {}).get("data") or {}).get("body") or {})
+                 .get("song") or {}).get("list") or []
+        rows = [{
+            "id": item.get("mid"),
+            "name": item.get("name") or item.get("title") or "",
+            "artist": " / ".join(x.get("name", "") for x in (item.get("singer") or [])),
+            "duration": int(item.get("interval") or 0) * 1000,
+        } for item in songs]
+        for cand in self._rank_candidates(rows, song):
+            for prefix, ext in self._qq_formats():
+                url = await self._qq_track(cand["id"], prefix, ext)
+                if url:
+                    return url
+        return None
+
+    async def _qq_track(self, mid: str, prefix: str | None, ext: str) -> str | None:
+        if not mid:
+            return None
+        uin = (re.search(r"uin=(\d+)", self.qq_cookie or "") or [None, "0"])[1]
+        payload = {"req_0": {
+            "module": "vkey.GetVkeyServer", "method": "CgiGetVkey",
+            "param": {"guid": str(random.randint(1, 9999999)), "loginflag": 1,
+                      "filename": [f"{prefix}{mid}{ext}"] if prefix else None,
+                      "songmid": [mid], "songtype": [0], "uin": uin, "platform": "20"},
+        }}
+        resp = await self._unlock_client.get(self._qq_url_of(payload), headers=self._qq_headers())
+        data = (((resp.json() or {}).get("req_0") or {}).get("data")) or {}
+        purl = ((data.get("midurlinfo") or [{}])[0]).get("purl")
+        sip = data.get("sip") or []
+        if purl and sip:
+            base, path = str(sip[0]), str(purl)
+            # sip 和 purl 的斜杠组合不固定（有的带有的不带），按需补/去，别拼出 // 或丢掉 /
+            if base.endswith("/") and path.startswith("/"):
+                return base[:-1] + path
+            if not base.endswith("/") and not path.startswith("/"):
+                return base + "/" + path
+            return base + path
+        return None
+
+    # -------------------------- 酷我 / 酷狗 -------------------------- #
     async def _kuwo_url(self, keyword: str, song: dict) -> str | None:
         resp = await self._unlock_client.get(KUWO_SEARCH_API.format(quote(keyword)))
         resp.raise_for_status()
@@ -700,12 +822,13 @@ class NeteaseUnblockPlugin(Star):
                 "artist": item.get("ARTIST") or "",
                 "duration": int(item.get("DURATION") or 0) * 1000,
             })
-        best = self._pick_best(rows, song)
-        if not best:
-            return None
-        resp = await self._unlock_client.get(KUWO_TRACK_API.format(best["id"]), headers=UA_OKHTTP)
-        match = _URL_RE.search(resp.text or "")
-        return match.group(0) if match else None
+        for cand in self._rank_candidates(rows, song):
+            resp = await self._unlock_client.get(KUWO_TRACK_API.format(cand["id"]),
+                                                 headers=UA_OKHTTP)
+            match = _URL_RE.search(resp.text or "")
+            if match:
+                return match.group(0)
+        return None
 
     async def _kugou_url(self, keyword: str, song: dict) -> str | None:
         resp = await self._unlock_client.get(KUGOU_SEARCH_API.format(quote(keyword)))
@@ -721,20 +844,18 @@ class NeteaseUnblockPlugin(Star):
                 "album": item.get("album_id") or "",
                 "duration": int(item.get("duration") or 0) * 1000,
             })
-        best = self._pick_best(rows, song)
-        if not best:
-            return None
-        for field in ("id_sq", "id_hq", "id"):  # 有损的优先，其次高码率
-            file_hash = best.get(field)
-            if not file_hash:
-                continue
-            digest = hashlib.md5(f"{file_hash}kgcloudv2".encode()).hexdigest()
-            resp = await self._unlock_client.get(KUGOU_TRACK_API.format(
-                key=digest, hash=file_hash, album=best.get("album") or ""))
-            urls = (resp.json() or {}).get("url") or []
-            url = urls[0] if urls else None
-            if isinstance(url, str) and url.startswith("http"):
-                return url
+        for cand in self._rank_candidates(rows, song):
+            for field in ("id_sq", "id_hq", "id"):  # 有损的优先，其次高码率
+                file_hash = cand.get(field)
+                if not file_hash:
+                    continue
+                digest = hashlib.md5(f"{file_hash}kgcloudv2".encode()).hexdigest()
+                resp = await self._unlock_client.get(KUGOU_TRACK_API.format(
+                    key=digest, hash=file_hash, album=cand.get("album") or ""))
+                urls = (resp.json() or {}).get("url") or []
+                url = urls[0] if urls else None
+                if isinstance(url, str) and url.startswith("http"):
+                    return url
         return None
 
     async def _is_audio(self, url: str) -> bool:
@@ -775,13 +896,11 @@ class NeteaseUnblockPlugin(Star):
             logger.warning(f"[netease_unblock] 表情回应失败: {e!r}")
 
     async def _resolve_results(self, event: AstrMessageEvent, song: dict,
-                               mode: str | None = None,
-                               alternatives: list[dict] | None = None):
+                               mode: str | None = None):
         """获取直链并构造发送结果（异步生成器）：按指定/默认模式发卡片 / 文件 / 语音 / 文本。
 
-        首选那首（通常是原唱）取不到直链时，先按「歌名+歌手」去酷我/酷狗找**同一首**
-        ——版权下架的歌在这几家反而是完整原版；别家也找不到，才退回换一个能播的版本
-        并明确告诉用户发的不是原唱。
+        首选那首（通常是原唱）在网易云取不到直链时，按配置的音源顺序去
+        QQ音乐/酷狗/酷我找**同一首原唱**，静默换源、不再退化成翻唱版。
         """
         mode = mode or self.send_mode
         link = SONG_LINK.format(song["id"])
@@ -793,49 +912,24 @@ class NeteaseUnblockPlugin(Star):
             audio = None
 
         notice = ""
-        if not audio and self.cross_platform:
+        if not audio and self.music_source:
             # 同一首歌换平台找：还是原唱，只是音源来自别家
             found = await self._other_platform_url(song)
             if found:
-                audio, platform = found
-                notice = (f"🎵 原唱「{song['name']} - {song['artists'] or '未知歌手'}」"
-                          f"网易云取不到，已改用{platform}音源：\n")
-
-        if not audio and alternatives:
-            tried = 0
-            for alt in alternatives:
-                if tried >= FALLBACK_TRY_LIMIT:
-                    break
-                if alt.get("id") == song.get("id"):
-                    continue
-                tried += 1
-                try:
-                    url = await self._match(alt["id"])
-                except Exception:
-                    url = None
-                if not url:
-                    continue
-                notice = (
-                    f"⚠️ 原唱「{song['name']} - {song['artists'] or '未知歌手'}」取不到直链，"
-                    f"换成这一版：\n"
-                )
-                logger.info(f"[netease_unblock] {song['id']} 取不到直链，回退到 {alt['id']}")
-                song, audio = alt, url
-                link = SONG_LINK.format(song["id"])
-                break
+                audio, _platform = found
+                # 静默换源：不再发「已改用xx音源」这类提示，直接发歌
 
         if not audio:
             api = self.unlock_api or "（未配置 API 地址）"
-            yield event.plain_result(
+            r = await self._say(event, 
                 f"❌ {song['name']} - {song['artists'] or '未知歌手'}\n"
                 f"获取直链失败：音源服务 {api} 没有可用音源或不可达\n"
                 f"{MATCH_FAIL_HINT}\n"
                 f"🔗 {link}"
             )
+            if r is not None:
+                yield r
             return
-
-        if notice:
-            yield event.plain_result(notice)
 
         if mode == "file":
             async for r in self._send_file(event, song, audio):
@@ -850,7 +944,9 @@ class NeteaseUnblockPlugin(Star):
         text = f"🎵 {song['name']} - {song['artists']}\n🔗 {link}\n▶️ 直链：{audio}"
 
         if mode == "text":
-            yield event.plain_result(text)
+            r = await self._say(event, text)
+            if r is not None:
+                yield r
             return
 
         if event.get_platform_name() == "aiocqhttp" and hasattr(event, "bot"):
@@ -874,14 +970,15 @@ class NeteaseUnblockPlugin(Star):
                     logger.warning(f"[netease_unblock] 音乐卡片({type(card).__name__})发送失败: {e!r}")
             logger.error("[netease_unblock] 两种音乐卡片均被协议端拒绝，回退文本")
 
-        yield event.plain_result(text)
+        r = await self._say(event, text)
+        if r is not None:
+            yield r
 
     async def _progress(self, event: AstrMessageEvent, text: str):
-        """进度提示：aiocqhttp 平台直发并定时撤回，否则普通发送。"""
-        if self.retract_seconds > 0 and event.get_platform_name() == "aiocqhttp" and hasattr(event, "bot"):
-            if await self._send_and_schedule_retract(event, text, self.retract_seconds):
-                return
-        yield event.plain_result(text)
+        """进度提示：与 _say 一致，直发并定时撤回，否则普通发送。"""
+        r = await self._say(event, text)
+        if r is not None:
+            yield r
 
     async def _send_file(self, event: AstrMessageEvent, song: dict, audio: str):
         """下载音乐并以文件形式发送，内嵌歌词后定时删除本地文件。"""
@@ -891,7 +988,9 @@ class NeteaseUnblockPlugin(Star):
             path = await self._download_song(song, audio)
         except Exception as e:
             logger.error(f"[netease_unblock] 文件下载失败: {e!r}")
-            yield event.plain_result(f"❌ 文件下载失败：{e!r}\n▶️ 直链：{audio}")
+            r = await self._say(event, f"❌ 文件下载失败：{e!r}\n▶️ 直链：{audio}")
+            if r is not None:
+                yield r
             return
         if self.embed_lyrics:
             lrc = await self._fetch_lyrics(song["id"])
@@ -912,7 +1011,9 @@ class NeteaseUnblockPlugin(Star):
             yield event.chain_result([File(name=path.name, file=str(path))])
         except Exception as e:
             logger.error(f"[netease_unblock] 文件发送失败: {e!r}")
-            yield event.plain_result(f"❌ 文件发送失败\n▶️ 直链：{audio}")
+            r = await self._say(event, f"❌ 文件发送失败\n▶️ 直链：{audio}")
+            if r is not None:
+                yield r
         finally:
             if self.delete_file_seconds > 0:
                 asyncio.create_task(self._delete_later(path, self.delete_file_seconds))
@@ -1023,13 +1124,17 @@ class NeteaseUnblockPlugin(Star):
             path = await self._download_song(song, audio)
         except Exception as e:
             logger.error(f"[netease_unblock] 语音下载失败: {e!r}")
-            yield event.plain_result(f"❌ 语音获取失败：{e!r}\n▶️ 直链：{audio}")
+            r = await self._say(event, f"❌ 语音获取失败：{e!r}\n▶️ 直链：{audio}")
+            if r is not None:
+                yield r
             return
         try:
             yield event.chain_result([Record.fromFileSystem(str(path))])
         except Exception as e:
             logger.error(f"[netease_unblock] 语音发送失败: {e!r}")
-            yield event.plain_result(f"❌ 语音发送失败\n▶️ 直链：{audio}")
+            r = await self._say(event, f"❌ 语音发送失败\n▶️ 直链：{audio}")
+            if r is not None:
+                yield r
         finally:
             # 语音在发送时已被转 base64，临时文件立即清理，不占存储
             try:
@@ -1086,6 +1191,17 @@ class NeteaseUnblockPlugin(Star):
     def _sanitize_filename(name: str) -> str:
         name = _ILLEGAL_FILENAME_CHARS.sub("_", name).strip(" .")
         return name[:120] or "song"
+
+    async def _say(self, event: AstrMessageEvent, text: str):
+        """**所有文字消息的统一出口**：能撤回就直发 + 定时撤回，撤回不了就普通发送。
+
+        返回 None 表示已直发（调用方不要再 yield）；否则返回可 yield 的结果对象。
+        """
+        if (self.retract_seconds > 0 and event.get_platform_name() == "aiocqhttp"
+                and hasattr(event, "bot")):
+            if await self._send_and_schedule_retract(event, text, self.retract_seconds):
+                return None
+        return event.plain_result(text)
 
     async def _send_and_schedule_retract(self, event: AstrMessageEvent, text: str, seconds: int) -> bool:
         """直发列表消息并安排到期撤回，返回是否成功直发。"""
@@ -1173,26 +1289,36 @@ class NeteaseUnblockPlugin(Star):
 
     async def _lyrics_flow(self, event: AstrMessageEvent, text: str):
         if not text:
-            yield event.plain_result("用法：歌词 <歌名|ID>（如：歌词 晴天 或 歌词 晴天|186016）")
+            r = await self._say(event, "用法：歌词 <歌名|ID>（如：歌词 晴天 或 歌词 晴天|186016）")
+            if r is not None:
+                yield r
             return
         sid = await self._resolve_song_id(text)
         if not sid:
-            yield event.plain_result(f"❌ 未找到「{text}」对应的歌曲")
+            r = await self._say(event, f"❌ 未找到「{text}」对应的歌曲")
+            if r is not None:
+                yield r
             return
         lrc = await self._fetch_lyrics(sid)
         if not lrc:
-            yield event.plain_result("❌ 该歌曲暂无歌词（或为纯音乐）")
+            r = await self._say(event, "❌ 该歌曲暂无歌词（或为纯音乐）")
+            if r is not None:
+                yield r
             return
         lines = lrc.splitlines()
         if len(lines) > 80:
             lines = lines[:80] + ["……（歌词过长已截断）"]
-        yield event.plain_result("🎤 歌词：\n" + "\n".join(lines))
+        r = await self._say(event, "🎤 歌词：\n" + "\n".join(lines))
+        if r is not None:
+            yield r
 
     async def _toplist_flow(self, event: AstrMessageEvent, arg: str):
         data = await self._api_get(TOP_LIST_API)
         boards = (data or {}).get("list") or []
         if not boards:
-            yield event.plain_result("❌ 排行榜获取失败")
+            r = await self._say(event, "❌ 排行榜获取失败")
+            if r is not None:
+                yield r
             return
         if not arg:
             shown = boards[:15]
@@ -1204,19 +1330,25 @@ class NeteaseUnblockPlugin(Star):
                 "boards": [{"id": b.get("id"), "name": b.get("name")} for b in shown],
                 "ts": time.time(),
             }
-            yield event.plain_result("\n".join(lines))
+            r = await self._say(event, "\n".join(lines))
+            if r is not None:
+                yield r
             return
         target = next(
             (b for b in boards if arg in (b.get("name") or "") or (b.get("name") or "") in arg),
             None,
         )
         if not target:
-            yield event.plain_result(f"❌ 未找到榜单「{arg}」，回复「排行」查看全部榜单")
+            r = await self._say(event, f"❌ 未找到榜单「{arg}」，回复「排行」查看全部榜单")
+            if r is not None:
+                yield r
             return
         detail = await self._api_get(PLAYLIST_DETAIL_API, {"id": target.get("id")})
         tracks = ((detail or {}).get("result") or {}).get("tracks") or []
         if not tracks:
-            yield event.plain_result("❌ 榜单曲目获取失败")
+            r = await self._say(event, "❌ 榜单曲目获取失败")
+            if r is not None:
+                yield r
             return
         shown = [self._normalize(s) for s in tracks[:10]]
         lines = [f"🏆 {target.get('name')}（{target.get('updateFrequency') or ''}）"]
@@ -1224,11 +1356,15 @@ class NeteaseUnblockPlugin(Star):
             lines.append(f"{i}. {self._fmt(song)}")
         self._remember_pick(event, shown)
         lines.append(PICK_HINT)
-        yield event.plain_result("\n".join(lines))
+        r = await self._say(event, "\n".join(lines))
+        if r is not None:
+            yield r
 
     async def _artist_flow(self, event: AstrMessageEvent, kw: str):
         if not kw:
-            yield event.plain_result("用法：歌手 <名字>（如：歌手 周杰伦）")
+            r = await self._say(event, "用法：歌手 <名字>（如：歌手 周杰伦）")
+            if r is not None:
+                yield r
             return
         try:
             artists = await self._search_type(kw, 100, 3)
@@ -1237,12 +1373,16 @@ class NeteaseUnblockPlugin(Star):
             artists = []
         target = next((a for a in artists if a.get("name") == kw), artists[0] if artists else None)
         if not target:
-            yield event.plain_result(f"❌ 未找到歌手「{kw}」")
+            r = await self._say(event, f"❌ 未找到歌手「{kw}」")
+            if r is not None:
+                yield r
             return
         detail = await self._api_get(f"https://music.163.com/api/artist/{target.get('id')}")
         hot = (detail or {}).get("hotSongs") or []
         if not hot:
-            yield event.plain_result("❌ 热门歌曲获取失败")
+            r = await self._say(event, "❌ 热门歌曲获取失败")
+            if r is not None:
+                yield r
             return
         shown = [self._normalize(s) for s in hot[:10]]
         lines = [f"🎤 {target.get('name')} 的热门歌曲"]
@@ -1250,11 +1390,15 @@ class NeteaseUnblockPlugin(Star):
             lines.append(f"{i}. {self._fmt(song)}")
         self._remember_pick(event, shown)
         lines.append(PICK_HINT)
-        yield event.plain_result("\n".join(lines))
+        r = await self._say(event, "\n".join(lines))
+        if r is not None:
+            yield r
 
     async def _album_flow(self, event: AstrMessageEvent, kw: str):
         if not kw:
-            yield event.plain_result("用法：专辑 <名字>（如：专辑 叶惠美）")
+            r = await self._say(event, "用法：专辑 <名字>（如：专辑 叶惠美）")
+            if r is not None:
+                yield r
             return
         try:
             albums = await self._search_type(kw, 10, 3)
@@ -1263,12 +1407,16 @@ class NeteaseUnblockPlugin(Star):
             albums = []
         target = next((a for a in albums if a.get("name") == kw), albums[0] if albums else None)
         if not target:
-            yield event.plain_result(f"❌ 未找到专辑「{kw}」")
+            r = await self._say(event, f"❌ 未找到专辑「{kw}」")
+            if r is not None:
+                yield r
             return
         detail = await self._api_get(f"https://music.163.com/api/album/{target.get('id')}")
         songs = (detail or {}).get("songs") or ((detail or {}).get("album") or {}).get("songs") or []
         if not songs:
-            yield event.plain_result("❌ 专辑曲目获取失败")
+            r = await self._say(event, "❌ 专辑曲目获取失败")
+            if r is not None:
+                yield r
             return
         artist_name = ((target.get("artist") or {}).get("name")) or (
             ((detail or {}).get("album") or {}).get("artist") or {}
@@ -1284,11 +1432,15 @@ class NeteaseUnblockPlugin(Star):
             lines.append(f"{i}. {self._fmt(song)}")
         self._remember_pick(event, shown)
         lines.append(PICK_HINT)
-        yield event.plain_result("\n".join(lines))
+        r = await self._say(event, "\n".join(lines))
+        if r is not None:
+            yield r
 
     async def _playlist_flow(self, event: AstrMessageEvent, kw: str):
         if not kw:
-            yield event.plain_result("用法：歌单 <关键词>（如：歌单 华语）")
+            r = await self._say(event, "用法：歌单 <关键词>（如：歌单 华语）")
+            if r is not None:
+                yield r
             return
         try:
             playlists = await self._search_type(kw, 1000, 3)
@@ -1297,12 +1449,16 @@ class NeteaseUnblockPlugin(Star):
             playlists = []
         target = playlists[0] if playlists else None
         if not target:
-            yield event.plain_result(f"❌ 未找到歌单「{kw}」")
+            r = await self._say(event, f"❌ 未找到歌单「{kw}」")
+            if r is not None:
+                yield r
             return
         detail = await self._api_get(PLAYLIST_DETAIL_API, {"id": target.get("id")})
         tracks = ((detail or {}).get("result") or {}).get("tracks") or []
         if not tracks:
-            yield event.plain_result("❌ 歌单曲目获取失败")
+            r = await self._say(event, "❌ 歌单曲目获取失败")
+            if r is not None:
+                yield r
             return
         play = target.get("playCount")
         play = f"{play} 次播放" if play else "热门歌单"
@@ -1312,20 +1468,28 @@ class NeteaseUnblockPlugin(Star):
             lines.append(f"{i}. {self._fmt(song)}")
         self._remember_pick(event, shown)
         lines.append(PICK_HINT)
-        yield event.plain_result("\n".join(lines))
+        r = await self._say(event, "\n".join(lines))
+        if r is not None:
+            yield r
 
     async def _comments_flow(self, event: AstrMessageEvent, text: str):
         if not text:
-            yield event.plain_result("用法：评论 <歌名|ID>（如：评论 晴天 或 评论 186016）")
+            r = await self._say(event, "用法：评论 <歌名|ID>（如：评论 晴天 或 评论 186016）")
+            if r is not None:
+                yield r
             return
         sid = await self._resolve_song_id(text)
         if not sid:
-            yield event.plain_result(f"❌ 未找到「{text}」对应的歌曲")
+            r = await self._say(event, f"❌ 未找到「{text}」对应的歌曲")
+            if r is not None:
+                yield r
             return
         data = await self._api_get(COMMENTS_API.format(sid=sid), {"limit": 5})
         hot = (data or {}).get("hotComments") or []
         if not hot:
-            yield event.plain_result("❌ 该歌曲暂无热评")
+            r = await self._say(event, "❌ 该歌曲暂无热评")
+            if r is not None:
+                yield r
             return
         total = (data or {}).get("total")
         lines = [f"💬 热评（共 {total} 条）：" if total else "💬 热评："]
@@ -1335,18 +1499,24 @@ class NeteaseUnblockPlugin(Star):
             if len(content) > 90:
                 content = content[:90] + "……"
             lines.append(f"{i}. {user}：{content}（赞 {c.get('likedCount', 0)}）")
-        yield event.plain_result("\n".join(lines))
+        r = await self._say(event, "\n".join(lines))
+        if r is not None:
+            yield r
 
     async def _new_songs_flow(self, event: AstrMessageEvent, arg: str):
         area = (arg or "华语").strip()
         area_id = NEW_SONG_AREAS.get(area)
         if area_id is None:
-            yield event.plain_result("可选地区：全部 / 华语 / 欧美 / 日本 / 韩国（如：新歌 欧美）")
+            r = await self._say(event, "可选地区：全部 / 华语 / 欧美 / 日本 / 韩国（如：新歌 欧美）")
+            if r is not None:
+                yield r
             return
         data = await self._api_get(NEW_SONGS_API, {"areaId": area_id})
         songs = (data or {}).get("data") or []
         if not songs:
-            yield event.plain_result("❌ 新歌速递获取失败")
+            r = await self._say(event, "❌ 新歌速递获取失败")
+            if r is not None:
+                yield r
             return
         shown = [self._normalize(s) for s in songs[:10]]
         lines = [f"🆕 {area}新歌速递："]
@@ -1354,13 +1524,17 @@ class NeteaseUnblockPlugin(Star):
             lines.append(f"{i}. {self._fmt(song)}")
         self._remember_pick(event, shown)
         lines.append(PICK_HINT)
-        yield event.plain_result("\n".join(lines))
+        r = await self._say(event, "\n".join(lines))
+        if r is not None:
+            yield r
 
     async def _random_flow(self, event: AstrMessageEvent):
         data = await self._api_get(RADIO_API)
         songs = (data or {}).get("data") or []
         if not songs:
-            yield event.plain_result("❌ 随机歌曲获取失败，请稍后重试")
+            r = await self._say(event, "❌ 随机歌曲获取失败，请稍后重试")
+            if r is not None:
+                yield r
             return
         song = self._normalize(random.choice(songs))
         await self._react(event)
@@ -1372,7 +1546,9 @@ class NeteaseUnblockPlugin(Star):
         key = self._cache_key(event)
         pending = self._pending.get(key)
         if not pending or pending.get("stage") != "pick_song" or not pending.get("songs"):
-            yield event.plain_result("❌ 没有待连播的列表，先「点歌 关键词」搜索一次再用连播")
+            r = await self._say(event, "❌ 没有待连播的列表，先「点歌 关键词」搜索一次再用连播")
+            if r is not None:
+                yield r
             return
         try:
             n = int(arg) if arg else 5
@@ -1384,7 +1560,9 @@ class NeteaseUnblockPlugin(Star):
         await self._react(event)
         ok = 0
         for i, song in enumerate(songs, 1):
-            yield event.plain_result(f"▶️ 连播 {i}/{len(songs)}：{song['name']} - {song['artists'] or '未知歌手'}")
+            r = await self._say(event, f"▶️ 连播 {i}/{len(songs)}：{song['name']} - {song['artists'] or '未知歌手'}")
+            if r is not None:
+                yield r
             try:
                 async for r in self._resolve_results(event, song, mode="voice"):
                     yield r
@@ -1392,7 +1570,9 @@ class NeteaseUnblockPlugin(Star):
             except Exception as e:
                 logger.warning(f"[netease_unblock] 连播第 {i} 首失败: {e!r}")
             await asyncio.sleep(2)
-        yield event.plain_result(f"✅ 连播结束（成功 {ok}/{len(songs)}）")
+        r = await self._say(event, f"✅ 连播结束（成功 {ok}/{len(songs)}）")
+        if r is not None:
+            yield r
 
     # ------------------------------------------------------------------ #
     # 指令与序号分发
@@ -1405,9 +1585,11 @@ class NeteaseUnblockPlugin(Star):
 
     async def _dian_ge_flow(self, event: AstrMessageEvent, kw: str, mode: str | None = None):
         if not kw:
-            yield event.plain_result(
+            r = await self._say(event, 
                 "用法：点歌 <歌名>（直接发「点歌 歌名」即可，无需前缀）\n也支持：直链 <歌曲ID或分享链接>"
             )
+            if r is not None:
+                yield r
             return
 
         await self._react(event)  # 收到命令先贴个表情当回执
@@ -1421,8 +1603,7 @@ class NeteaseUnblockPlugin(Star):
             idx = int(kw)
             if 1 <= idx <= len(songs):
                 self._pending.pop(key, None)
-                async for r in self._resolve_results(event, songs[idx - 1],
-                                                     pending.get("mode"), alternatives=songs):
+                async for r in self._resolve_results(event, songs[idx - 1], pending.get("mode")):
                     yield r
                 event.stop_event()
                 return
@@ -1430,20 +1611,28 @@ class NeteaseUnblockPlugin(Star):
         try:
             songs = await self._search(kw)
         except RateLimited:
-            yield event.plain_result("⏳ 网易云提示操作频繁，请稍等十几秒再点歌")
+            r = await self._say(event, "⏳ 网易云提示操作频繁，请稍等十几秒再点歌")
+            if r is not None:
+                yield r
             return
         except Exception as e:
             logger.error(f"[netease_unblock] 搜索失败: {e!r}", exc_info=True)
-            yield event.plain_result("❌ 搜索歌曲失败，请稍后重试")
+            r = await self._say(event, "❌ 搜索歌曲失败，请稍后重试")
+            if r is not None:
+                yield r
             return
         if not songs:
-            yield event.plain_result(f"❌ 未找到「{kw}」相关的歌曲")
+            r = await self._say(event, f"❌ 未找到「{kw}」相关的歌曲")
+            if r is not None:
+                yield r
             return
 
         if self.auto_pick or len(songs) == 1:
             if getattr(songs, "unresolved_covers", False):
-                yield event.plain_result(UNRESOLVED_COVER_HINT)
-            async for r in self._resolve_results(event, songs[0], mode, alternatives=songs):
+                r = await self._say(event, UNRESOLVED_COVER_HINT)
+                if r is not None:
+                    yield r
+            async for r in self._resolve_results(event, songs[0], mode):
                 yield r
             return
 
@@ -1459,7 +1648,9 @@ class NeteaseUnblockPlugin(Star):
         if self.retract_seconds > 0 and event.get_platform_name() == "aiocqhttp" and hasattr(event, "bot"):
             if await self._send_and_schedule_retract(event, text, self.retract_seconds):
                 return
-        yield event.plain_result(text)
+        r = await self._say(event, text)
+        if r is not None:
+            yield r
 
     @filter.command("直链")
     async def unlock(self, event: AstrMessageEvent, target: GreedyStr):
@@ -1471,7 +1662,9 @@ class NeteaseUnblockPlugin(Star):
         m = _ID_FROM_URL.search(text)
         song_id = m.group(1) if m else (text if text.isdigit() else "")
         if not song_id:
-            yield event.plain_result("用法：直链 <歌曲ID 或 歌曲分享链接>（直接发「直链 ID」即可）")
+            r = await self._say(event, "用法：直链 <歌曲ID 或 歌曲分享链接>（直接发「直链 ID」即可）")
+            if r is not None:
+                yield r
             return
 
         await self._react(event)
@@ -1535,13 +1728,17 @@ class NeteaseUnblockPlugin(Star):
             "语音": "voice", "voice": "voice",
         }
         if not m:
-            yield event.plain_result(
+            r = await self._say(event, 
                 f"当前发送模式：{SEND_MODE_CN[self.send_mode]}（发送「点歌模式 卡片/文件/文本」可切换）"
             )
+            if r is not None:
+                yield r
             return
         target = alias.get(m)
         if not target:
-            yield event.plain_result("未知模式，可选：卡片 / 文件 / 文本")
+            r = await self._say(event, "未知模式，可选：卡片 / 文件 / 文本")
+            if r is not None:
+                yield r
             return
         self.send_mode = target
         try:
@@ -1550,7 +1747,9 @@ class NeteaseUnblockPlugin(Star):
                 self._config.save_config()
         except Exception as e:
             logger.warning(f"[netease_unblock] 保存配置失败（本次运行内仍生效）: {e!r}")
-        yield event.plain_result(f"✅ 发送模式已切换为：{SEND_MODE_CN[target]}")
+        r = await self._say(event, f"✅ 发送模式已切换为：{SEND_MODE_CN[target]}")
+        if r is not None:
+            yield r
 
     @filter.command("帮助")
     async def help_cmd(self, event: AstrMessageEvent):
@@ -1604,7 +1803,9 @@ class NeteaseUnblockPlugin(Star):
             "👥 作者\n"
             "流水 · 听雨的蛙 · 落雪 · GLM-5.3-Flash"
         )
-        yield event.plain_result(tips)
+        r = await self._say(event, tips)
+        if r is not None:
+            yield r
 
     @filter.command("歌词")
     async def lyrics_cmd(self, event: AstrMessageEvent, keyword: GreedyStr):
@@ -1751,14 +1952,18 @@ class NeteaseUnblockPlugin(Star):
 
         if now - cache["ts"] > SELECT_TIMEOUT_SECONDS:
             self._pending.pop(key, None)
-            yield event.plain_result("❌ 选歌超时，请重新点歌")
+            r = await self._say(event, "❌ 选歌超时，请重新点歌")
+            if r is not None:
+                yield r
             event.stop_event()
             return
 
         idx = int(text)
         if idx == 0:
             self._pending.pop(key, None)
-            yield event.plain_result("已取消选歌")
+            r = await self._say(event, "已取消选歌")
+            if r is not None:
+                yield r
             event.stop_event()
             return
 
@@ -1780,7 +1985,6 @@ class NeteaseUnblockPlugin(Star):
 
         self._pending.pop(key, None)  # 进入执行即销毁，防止重复触发
         await self._react(event)  # 选中序号同样贴表情回执
-        async for r in self._resolve_results(event, songs[idx - 1], cache.get("mode"),
-                                             alternatives=songs):
+        async for r in self._resolve_results(event, songs[idx - 1], cache.get("mode")):
             yield r
         event.stop_event()

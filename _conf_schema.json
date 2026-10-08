@@ -24,16 +24,22 @@
     "hint": "HEAD 探测返回的直链，过滤网易云 VIP 占位 HTML 页（bugpk 对 VIP 歌会返回假链接）。关闭可省一次探测请求，但可能发出无法播放的卡片。",
     "default": true
   },
-  "cross_platform": {
-    "description": "跨平台音源兜底",
+  "music_source": {
+    "description": "音源切换（网易云取不到时用哪家）",
     "type": "string",
-    "hint": "网易云取不到直链时（版权下架的歌，如周杰伦），按这里的顺序去别家找【同一首原唱】。可选 kuwo（酷我）/ kugou（酷狗），逗号分隔；留空关闭。关键：这一步是在【跑机器人的机器】上直接连音源，跟后端部署在哪、后端连不连得上音源无关——所以后端在境外取不到周杰伦时，靠它照样能放。",
-    "default": "kuwo,kugou"
+    "hint": "网易云取不到的歌（版权下架的，如周杰伦）按这里的顺序去别家找【同一首原唱】。可选 qq（QQ音乐，默认）/ kugou（酷狗）/ kuwo（酷我），逗号分隔，留空关闭。关键：这一步是在【跑机器人的机器】上直连音源，跟后端部署在哪无关，所以后端在境外也能放周杰伦。注意 QQ音乐 的无损/会员曲目需要下面填 Cookie 才能取到，否则会自动落到酷狗/酷我。",
+    "default": "qq,kugou,kuwo"
+  },
+  "qq_cookie": {
+    "description": "QQ音乐 Cookie（可选）",
+    "type": "string",
+    "hint": "想让 QQ音乐 音源能放会员/无损曲目就填这里，格式如 uin=123456; qqmusic_key=xxxxxx;（浏览器登录 y.qq.com 后从 Cookie 里复制）。留空则 QQ音乐 只能取到免费曲目，取不到会自动换酷狗/酷我。",
+    "default": ""
   },
   "retract_list_seconds": {
-    "description": "搜索结果自动撤回（秒）",
+    "description": "文字消息自动撤回（秒）",
     "type": "int",
-    "hint": "搜索结果列表发送 N 秒后自动撤回，0 = 不撤回。仅 aiocqhttp 平台生效。",
+    "hint": "插件发出的所有文字消息（列表、歌词、提示、报错等）在 N 秒后自动撤回，0 = 不撤回。仅 aiocqhttp 平台生效。",
     "default": 60
   },
   "react_emoji": {
