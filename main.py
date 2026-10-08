@@ -8,7 +8,6 @@
 """
 
 import asyncio
-import hashlib
 import json
 import os
 import random
@@ -52,46 +51,35 @@ PICK_HINT = f"想听哪首：回复序号直接点歌（{SELECT_TIMEOUT_SECONDS}
 """列表类命令末尾的统一提示"""
 NETEASE_LEVEL = "exhigh"
 """走官方 /song/url/v1 时请求的音质（账号不支持会自动降级）"""
-
-# ---------------------------------------------------------------------- #
-# 跨平台备选音源：网易云取不到的（版权下架歌，如周杰伦），直接去别家找同一首
-# ---------------------------------------------------------------------- #
-KUWO_SEARCH_API = (
-    "http://search.kuwo.cn/r.s?&correct=1&vipver=1&stype=comprehensive&encoding=utf8"
-    "&rformat=json&mobi=1&show_copyright_off=1&searchapi=6&all={}"
-)
-KUWO_TRACK_API = (
-    "http://antiserver.kuwo.cn/anti.s?type=convert_url&format=mp3&response=url&rid=MUSIC_{}"
-)
-KUGOU_SEARCH_API = (
-    "http://mobilecdn.kugou.com/api/v3/search/song?keyword={}&page=1&pagesize=10"
-)
-KUGOU_TRACK_API = (
-    "http://trackercdn.kugou.com/i/v2/?key={key}&hash={hash}"
-    "&appid=1005&pid=2&cmd=25&behavior=play&album_id={album}"
-)
-QQ_API = "https://u.y.qq.com/cgi-bin/musicu.fcg"
-QQ_HEADERS = {"origin": "http://y.qq.com/", "referer": "http://y.qq.com/"}
-QQ_FLAC_FORMATS = (("F000", ".flac"), ("M800", ".mp3"), ("M500", ".mp3"))
-QQ_FREE_FORMATS = ((None, None),)
-"""QQ 无 Cookie 时只能按默认码率取（filename 传 null）"""
-UA_OKHTTP = {"user-agent": "okhttp/3.10.0"}
-_URL_RE = re.compile(r"""http[^\s$"']+""")
-PLATFORM_CN = {"qq": "QQ音乐", "kuwo": "酷我", "kugou": "酷狗"}
-MUSIC_SOURCE_DEFAULT = "qq,kugou,kuwo"
-"""网易云取不到时，按顺序去哪些平台找同一首原唱（默认 QQ音乐优先）；留空关闭"""
-DURATION_TOLERANCE_MS = 3000
-"""跨平台匹配时认为「同一个版本」的时长容差"""
 ORIGINAL_SHORTLIST = 3
 """深扫最多留几个同名候选去比评论数"""
 POPULAR_RATIO = 5
 """评论数高出这么多倍才认定是原唱（原唱通常比翻唱高几个数量级）"""
 POPULAR_MIN_COMMENTS = 20
 """评论数至少这么多才有资格当原唱，避免冷门歌乱换"""
+
+# ---------------------------------------------------------------------- #
+# 用自己的洛雪(LX Music)音源脚本取直链
+#   音源脚本只提供 musicUrl（搜索由调用方做），所以插件先用酷我按
+#   「歌名+歌手」查到歌曲 ID，再把它交给音源脚本换成可播放直链。
+# ---------------------------------------------------------------------- #
+KUWO_SEARCH_API = (
+    "http://search.kuwo.cn/r.s?&correct=1&vipver=1&stype=comprehensive&encoding=utf8"
+    "&rformat=json&mobi=1&show_copyright_off=1&searchapi=6&all={}"
+)
+KUWO_SOURCE_KEY = "kw"
+"""音源脚本里酷我的平台名"""
+DURATION_TOLERANCE_MS = 3000
+"""判定「同一个版本」的时长容差"""
+LX_DEFAULT_QUALITY = "320k"
+"""向音源脚本请求的音质"""
+LX_TIMEOUT_SECONDS = 45.0
+"""单个音源脚本的执行超时（音源要连它自己的后端，给宽一点）"""
+LX_PLATFORM_CN = {"wy": "网易云", "kw": "酷我", "kg": "酷狗", "tx": "QQ", "mg": "咪咕"}
 MATCH_FAIL_HINT = (
-    "💡 音源服务取不到就发不出歌。版权下架的原唱只有跨平台音源能取，"
-    "服务若部署在境外（如 Vercel 默认美国节点）会连不上酷我——"
-    "把服务跑在国内网络，或「直链 <歌曲ID>」单独试其它版本。"
+    "💡 音源服务取不到就发不出歌。版权下架的原唱（如周杰伦）要靠音源服务里的"
+    "跨平台音源去酷我/酷狗找；服务若部署在境外（如 Vercel 默认美国节点）会连不上，"
+    "把服务跑在国内网络即可。"
 )
 """直链获取失败的排查提示"""
 CACHE_JANITOR_SECONDS = 300
@@ -186,14 +174,15 @@ class NeteaseUnblockPlugin(Star):
         # AstrBotConfig 不做类型校验，空值不合法的配置一律用 or 兜底。
         self.unlock_api = (config.get("unlock_api") or "").rstrip("/")
         self.source = (config.get("source") or "").strip()
+        self.lx_source = str(config.get("lx_source") or "").strip()
+        self.lx_node = str(config.get("lx_node") or "").strip() or "node"
+        self.lx_quality = str(config.get("lx_quality") or "").strip() or LX_DEFAULT_QUALITY
+        self._lx_runtime = Path(__file__).resolve().parent / "lx_runtime.js"
+        self._lx_files: list[str] = []
+        self._lx_checked = False
         self.auto_pick = bool(config.get("auto_pick") or False)
         _po = config.get("prefer_original")
         self.prefer_original = True if _po is None else bool(_po)
-        _cp = config.get("music_source")
-        if _cp is None:
-            _cp = config.get("cross_platform")  # 兼容 v2.3 的旧配置名
-        self.music_source = (MUSIC_SOURCE_DEFAULT if _cp is None else str(_cp).strip())
-        self.qq_cookie = str(config.get("qq_cookie") or "").strip()
         self.limit = self._safe_int(config.get("limit"), 10)
         self.timeout = self._safe_float(config.get("timeout"), 15.0)
         self.proxy = (config.get("proxy") or "").strip()
@@ -666,151 +655,83 @@ class NeteaseUnblockPlugin(Star):
         return None
 
     # ------------------------------------------------------------------ #
-    # 跨平台找原唱（网易云版权下架的歌，去酷我/酷狗拿同一首）
+    # 自己的洛雪音源
     # ------------------------------------------------------------------ #
-    @classmethod
-    def _rank_candidates(cls, candidates: list[dict], song: dict) -> list[dict]:
-        """给别家的搜索结果打分排序，只保留「同一个版本」的。
+    def _lx_sources(self) -> list[str]:
+        """解析配置里的音源脚本路径（支持目录、多个路径、逗号/换行分隔）。
 
-        判据：曲名去括号后必须同名、歌手对得上、**时长接近**（同一录音），
-        带翻唱/现场标记的直接排除——除非用户自己点名的就是那个版本。
-        返回按可信度从高到低排好的列表，供逐个尝试取直链。
+        目录会展开成里面的 *.js；同一脚本可能既在目录里又被单独列出，
+        按绝对路径去重，避免同一个音源被跑两遍。
         """
+        if self._lx_checked:
+            return self._lx_files
+        self._lx_checked = True
+        found: list[str] = []
+        seen: set[str] = set()
+
+        def _add(path: Path) -> None:
+            key = str(path.resolve())
+            if key in seen:
+                return
+            seen.add(key)
+            found.append(str(path))
+
+        raw = (self.lx_source or "").replace("，", ",").replace("\n", ",")
+        for item in raw.split(","):
+            item = item.strip().strip('"')
+            if not item:
+                continue
+            path = Path(item)
+            if path.is_dir():
+                for js in sorted(path.glob("*.js")):
+                    _add(js)
+            elif path.is_file():
+                _add(path)
+            else:
+                logger.warning(f"[netease_unblock] 音源脚本不存在: {item}")
+        self._lx_files = found
+        if found:
+            logger.info(f"[netease_unblock] 已加载 {len(found)} 个洛雪音源脚本")
+        return found
+
+    @classmethod
+    def _pick_same_version(cls, candidates: list[dict], song: dict) -> dict | None:
+        """在别家搜索结果里挑「同一个版本」的那条：同名 + 歌手对得上 + 时长一致。"""
         want_name = cls._base_title(song.get("name") or "")
         want_artist = re.sub(r"\s|/", "", song.get("artists") or "")
         want_dur = int(song.get("duration") or 0)
         want_is_cover = cls._looks_like_cover(song.get("name") or "")
-        scored = []
+        best, best_score = None, 0
         for cand in candidates:
             cand_name = cand.get("name") or ""
             if cls._base_title(cand_name) != want_name:
-                continue  # 曲名对不上直接丢，宁缺毋滥
+                continue
             if not want_is_cover and cls._looks_like_cover(cand_name):
-                continue  # 别家的 Live/翻唱不要，原唱才是目标
+                continue
             artist = re.sub(r"\s|/", "", cand.get("artist") or "")
             artist_ok = bool(want_artist and artist
                              and (want_artist in artist or artist in want_artist))
             if want_artist and artist and not artist_ok:
-                continue  # 歌手对不上
+                continue
             dur = int(cand.get("duration") or 0)
             if want_dur and dur and abs(dur - want_dur) > DURATION_TOLERANCE_MS * 3:
-                continue  # 时长差太多 = 不是同一个版本
-            score = 60
-            if artist_ok:
-                score += 30
+                continue
+            score = 60 + (30 if artist_ok else 0)
             if want_dur and dur and abs(dur - want_dur) <= DURATION_TOLERANCE_MS:
                 score += 40
-            scored.append((score, cand))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return [cand for _, cand in scored]
+            if score > best_score:
+                best, best_score = cand, score
+        return best
 
-    @classmethod
-    def _pick_best(cls, candidates: list[dict], song: dict) -> dict | None:
-        """取可信度最高的那一条（没有合适的返回 None）。"""
-        ranked = cls._rank_candidates(candidates, song)
-        return ranked[0] if ranked else None
-
-    async def _other_platform_url(self, song: dict) -> tuple[str, str] | None:
-        """网易云取不到时，按配置的顺序去别家找**同一首原唱**。
-
-        返回 (直链, 平台名)。这几家是自己的曲库，周杰伦这类在网易云下架的歌
-        在 QQ音乐/酷狗/酷我反而是完整原版。
-        """
-        name = (song.get("name") or "").strip()
-        if not name:
+    async def _kuwo_songid(self, song: dict) -> str | None:
+        """按「歌名 + 歌手」在酷我查出歌曲 ID，交给音源脚本用。"""
+        keyword = f"{song.get('name') or ''} {song.get('artists') or ''}".strip()
+        if not keyword:
             return None
-        keyword = f"{name} {song.get('artists') or ''}".strip()
-        for key in (self.music_source or "").split(","):
-            key = key.strip().lower()
-            finder = {"qq": self._qq_url, "kuwo": self._kuwo_url,
-                      "kugou": self._kugou_url}.get(key)
-            if not finder:
-                continue
-            try:
-                url = await finder(keyword, song)
-            except Exception as e:
-                logger.warning(f"[netease_unblock] {PLATFORM_CN.get(key, key)} 取直链异常: {e!r}")
-                continue
-            if not url:
-                continue
-            if self.verify_audio and not await self._is_audio(url):
-                logger.warning(f"[netease_unblock] {PLATFORM_CN.get(key, key)} 返回的不是音频，跳过")
-                continue
-            logger.info(f"[netease_unblock] 「{name}」改走{PLATFORM_CN.get(key, key)}取到原唱直链")
-            return url, PLATFORM_CN.get(key, key)
-        return None
-
-    # -------------------------- QQ 音乐 -------------------------- #
-    @staticmethod
-    def _qq_url_of(payload: dict) -> str:
-        return QQ_API + "?data=" + quote(json.dumps(payload, ensure_ascii=False))
-
-    def _qq_headers(self) -> dict:
-        headers = dict(QQ_HEADERS)
-        if self.qq_cookie:
-            headers["cookie"] = self.qq_cookie
-        return headers
-
-    def _qq_formats(self):
-        """有 Cookie 才可能吃到无损；没有就只能按默认码率要。"""
-        return QQ_FLAC_FORMATS if self.qq_cookie else QQ_FREE_FORMATS
-
-    async def _qq_url(self, keyword: str, song: dict) -> str | None:
-        payload = {"search": {
-            "method": "DoSearchForQQMusicDesktop",
-            "module": "music.search.SearchCgiService",
-            "param": {"num_per_page": 10, "page_num": 1,
-                      "query": keyword, "search_type": 0},
-        }}
-        resp = await self._unlock_client.get(self._qq_url_of(payload), headers=self._qq_headers())
-        resp.raise_for_status()
-        body = resp.json() or {}
-        songs = ((((body.get("search") or {}).get("data") or {}).get("body") or {})
-                 .get("song") or {}).get("list") or []
-        rows = [{
-            "id": item.get("mid"),
-            "name": item.get("name") or item.get("title") or "",
-            "artist": " / ".join(x.get("name", "") for x in (item.get("singer") or [])),
-            "duration": int(item.get("interval") or 0) * 1000,
-        } for item in songs]
-        for cand in self._rank_candidates(rows, song):
-            for prefix, ext in self._qq_formats():
-                url = await self._qq_track(cand["id"], prefix, ext)
-                if url:
-                    return url
-        return None
-
-    async def _qq_track(self, mid: str, prefix: str | None, ext: str) -> str | None:
-        if not mid:
-            return None
-        uin = (re.search(r"uin=(\d+)", self.qq_cookie or "") or [None, "0"])[1]
-        payload = {"req_0": {
-            "module": "vkey.GetVkeyServer", "method": "CgiGetVkey",
-            "param": {"guid": str(random.randint(1, 9999999)), "loginflag": 1,
-                      "filename": [f"{prefix}{mid}{ext}"] if prefix else None,
-                      "songmid": [mid], "songtype": [0], "uin": uin, "platform": "20"},
-        }}
-        resp = await self._unlock_client.get(self._qq_url_of(payload), headers=self._qq_headers())
-        data = (((resp.json() or {}).get("req_0") or {}).get("data")) or {}
-        purl = ((data.get("midurlinfo") or [{}])[0]).get("purl")
-        sip = data.get("sip") or []
-        if purl and sip:
-            base, path = str(sip[0]), str(purl)
-            # sip 和 purl 的斜杠组合不固定（有的带有的不带），按需补/去，别拼出 // 或丢掉 /
-            if base.endswith("/") and path.startswith("/"):
-                return base[:-1] + path
-            if not base.endswith("/") and not path.startswith("/"):
-                return base + "/" + path
-            return base + path
-        return None
-
-    # -------------------------- 酷我 / 酷狗 -------------------------- #
-    async def _kuwo_url(self, keyword: str, song: dict) -> str | None:
         resp = await self._unlock_client.get(KUWO_SEARCH_API.format(quote(keyword)))
         resp.raise_for_status()
-        data = resp.json() or {}
-        content = data.get("content") or []
-        page = (content[1] if len(content) > 1 and isinstance(content[1], dict) else {})
+        content = (resp.json() or {}).get("content") or []
+        page = content[1] if len(content) > 1 and isinstance(content[1], dict) else {}
         rows = []
         for item in ((page.get("musicpage") or {}).get("abslist") or []):
             rid = str(item.get("MUSICRID") or "").split("_")[-1]
@@ -822,44 +743,84 @@ class NeteaseUnblockPlugin(Star):
                 "artist": item.get("ARTIST") or "",
                 "duration": int(item.get("DURATION") or 0) * 1000,
             })
-        for cand in self._rank_candidates(rows, song):
-            resp = await self._unlock_client.get(KUWO_TRACK_API.format(cand["id"]),
-                                                 headers=UA_OKHTTP)
-            match = _URL_RE.search(resp.text or "")
-            if match:
-                return match.group(0)
+        best = self._pick_same_version(rows, song)
+        return best["id"] if best else None
+
+    async def _call_lx(self, source_file: str, payload: dict) -> str | None:
+        """跑一次音源脚本，返回它给出的直链（失败返回 None）。"""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.lx_node, str(self._lx_runtime), source_file,
+                json.dumps(payload, ensure_ascii=False),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            logger.warning(f"[netease_unblock] 找不到 node（{self.lx_node}），洛雪音源不可用")
+            return None
+        except Exception as e:
+            logger.warning(f"[netease_unblock] 启动音源脚本失败: {e!r}")
+            return None
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(),
+                                            timeout=LX_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            proc.kill()
+            logger.warning(f"[netease_unblock] 音源脚本超时: {Path(source_file).name}")
+            return None
+        text = (out or b"").decode("utf-8", "replace").strip()
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                data = json.loads(line)
+            except ValueError:
+                continue
+            url = data.get("url")
+            if data.get("ok") and isinstance(url, str) and url.startswith("http"):
+                return url
+            if data.get("error"):
+                logger.info(f"[netease_unblock] {Path(source_file).name}: {data['error']}")
+            return None
         return None
 
-    async def _kugou_url(self, keyword: str, song: dict) -> str | None:
-        resp = await self._unlock_client.get(KUGOU_SEARCH_API.format(quote(keyword)))
-        resp.raise_for_status()
-        rows = []
-        for item in (((resp.json() or {}).get("data") or {}).get("info") or []):
-            rows.append({
-                "id": item.get("hash"),
-                "id_hq": item.get("320hash"),
-                "id_sq": item.get("sqhash"),
-                "name": item.get("songname") or "",
-                "artist": item.get("singername") or "",
-                "album": item.get("album_id") or "",
-                "duration": int(item.get("duration") or 0) * 1000,
-            })
-        for cand in self._rank_candidates(rows, song):
-            for field in ("id_sq", "id_hq", "id"):  # 有损的优先，其次高码率
-                file_hash = cand.get(field)
-                if not file_hash:
-                    continue
-                digest = hashlib.md5(f"{file_hash}kgcloudv2".encode()).hexdigest()
-                resp = await self._unlock_client.get(KUGOU_TRACK_API.format(
-                    key=digest, hash=file_hash, album=cand.get("album") or ""))
-                urls = (resp.json() or {}).get("url") or []
-                url = urls[0] if urls else None
-                if isinstance(url, str) and url.startswith("http"):
-                    return url
+    async def _lx_url(self, song: dict) -> str | None:
+        """用自己的洛雪音源取直链：先查酷我歌曲 ID，再交给音源脚本换直链。"""
+        files = self._lx_sources()
+        if not files or not (song.get("name") or "").strip():
+            return None
+        try:
+            rid = await self._kuwo_songid(song)
+        except Exception as e:
+            logger.warning(f"[netease_unblock] 酷我查歌曲 ID 失败: {e!r}")
+            return None
+        if not rid:
+            logger.info(f"[netease_unblock] 酷我没查到「{song.get('name')}」，跳过洛雪音源")
+            return None
+        payload = {
+            "source": KUWO_SOURCE_KEY,
+            "quality": self.lx_quality,
+            "musicInfo": {
+                "songmid": rid, "rid": rid, "id": rid, "hash": rid,
+                "name": song.get("name") or "",
+                "singer": song.get("artists") or "",
+                "albumName": song.get("album") or "",
+                "interval": "",
+            },
+        }
+        for source_file in files:
+            url = await self._call_lx(source_file, payload)
+            if not url:
+                continue
+            if self.verify_audio and not await self._is_audio(url):
+                logger.info(f"[netease_unblock] {Path(source_file).name} 返回的不是音频，换下一个")
+                continue
+            logger.info(f"[netease_unblock] 洛雪音源 {Path(source_file).name} 取到直链")
+            return url
         return None
 
     async def _is_audio(self, url: str) -> bool:
-        """HEAD 探测直链内容类型，过滤网易云 VIP 占位 HTML 页。"""
         try:
             resp = await self._unlock_client.head(url)
             ctype = (resp.headers.get("content-type") or "").lower()
@@ -899,25 +860,23 @@ class NeteaseUnblockPlugin(Star):
                                mode: str | None = None):
         """获取直链并构造发送结果（异步生成器）：按指定/默认模式发卡片 / 文件 / 语音 / 文本。
 
-        首选那首（通常是原唱）在网易云取不到直链时，按配置的音源顺序去
-        QQ音乐/酷狗/酷我找**同一首原唱**，静默换源、不再退化成翻唱版。
+        直链优先问**自己的洛雪音源脚本**（配置 `lx_source` 指向的 .js），
+        取不到再回落到 `unlock_api` 音源服务；两边都没有才报错，不换别的版本充数。
         """
         mode = mode or self.send_mode
         link = SONG_LINK.format(song["id"])
+        audio = None
         try:
-            audio = await self._match(song["id"])
+            audio = await self._lx_url(song)  # 先用你自己的洛雪音源
         except Exception as e:
-            hint = "（已配置代理，请确认代理进程存活）" if self.proxy else "（可尝试在插件配置里填写本机代理）"
-            logger.error(f"[netease_unblock] 音源请求异常: {e!r} {hint}")
-            audio = None
-
-        notice = ""
-        if not audio and self.music_source:
-            # 同一首歌换平台找：还是原唱，只是音源来自别家
-            found = await self._other_platform_url(song)
-            if found:
-                audio, _platform = found
-                # 静默换源：不再发「已改用xx音源」这类提示，直接发歌
+            logger.warning(f"[netease_unblock] 洛雪音源异常: {e!r}")
+        if not audio:
+            try:
+                audio = await self._match(song["id"])  # 再用音源服务兜底
+            except Exception as e:
+                hint = "（已配置代理，请确认代理进程存活）" if self.proxy else "（可尝试在插件配置里填写本机代理）"
+                logger.error(f"[netease_unblock] 音源请求异常: {e!r} {hint}")
+                audio = None
 
         if not audio:
             api = self.unlock_api or "（未配置 API 地址）"
@@ -1769,7 +1728,7 @@ class NeteaseUnblockPlugin(Star):
         await self._react(event)  # 命令回执
         mode = self.send_mode
         tips = (
-            "🎵 网易云音乐点歌-flac v2.4\n"
+            "🎵 网易云音乐点歌-flac v2.5\n"
             "══════════════════\n"
             "📖 命令（加不加 / 前缀均可）\n"
             "点歌 <歌名>　　　搜索歌曲，回复序号选择\n"

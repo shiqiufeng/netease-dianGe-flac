@@ -2,9 +2,27 @@
   "unlock_api": {
     "description": "API 地址",
     "type": "string",
-    "hint": "填你部署好的网易云服务地址，末尾不带 /。两种后端都支持，插件会自己识别：① 网易云 API Enhanced（推荐，自带解灰，如 https://xxx.vercel.app）；② UnblockNeteaseMusic-utils。注意解灰要连酷我/酷狗，服务部署在境外（Vercel 默认美国节点）时版权下架的歌曲（如周杰伦）会取不到。留空则插件不可用。",
+    "hint": "填你部署的网易云服务地址（api-enhanced / UnblockNeteaseMusic-utils 都行，插件会用 /match 或 /song/url/match 取直链），末尾不带 /。这是**兜底**：优先用下面配的洛雪音源脚本。",
     "default": "",
     "obvious_hint": true
+  },
+  "lx_source": {
+    "description": "洛雪音源脚本（优先用它）",
+    "type": "string",
+    "hint": "你自己那套洛雪音乐(LX Music)音源 .js 的路径：可填目录（自动取里面的 .js）或具体文件，多个用逗号分隔。插件会用 node 加载这些音源，按「歌名+歌手」查酷我 ID 后交给音源脚本换直链——音源由你的脚本出，插件不自己连音乐平台。",
+    "default": ""
+  },
+  "lx_node": {
+    "description": "node 可执行文件",
+    "type": "string",
+    "hint": "跑洛雪音源脚本用的 node，默认 node（走 PATH）。找不到就填绝对路径，如 C:\\Program Files\\nodejs\\node.exe。",
+    "default": "node"
+  },
+  "lx_quality": {
+    "description": "音源请求音质",
+    "type": "string",
+    "hint": "向音源脚本请求的音质：128k / 320k / flac / flac24bit / hires 等，看音源支持哪些；默认 320k。",
+    "default": "320k"
   },
   "proxy": {
     "description": "音源请求代理",
@@ -13,9 +31,9 @@
     "default": ""
   },
   "source": {
-    "description": "音源优先级",
+    "description": "音源优先级（用服务上的哪个音源）",
     "type": "string",
-    "hint": "逗号分隔按顺序尝试：byfuns/ddyr 默认请求无损优先，auto=服务端自动（bugpk 兜底，仅免费歌可用）。如 byfuns,ddyr,auto",
+    "hint": "逗号分隔按顺序尝试【你音源服务里的音源】——插件自己不去连任何音乐平台。可选：unm（跨平台，能取版权下架的周杰伦等）、byfuns、ddyr、gdmusic、msls、oi、qijieya；auto = 交给服务端遍历全部。如 unm,auto 或 byfuns,ddyr,auto。",
     "default": "byfuns,ddyr,auto"
   },
   "verify_audio": {
@@ -23,18 +41,6 @@
     "type": "bool",
     "hint": "HEAD 探测返回的直链，过滤网易云 VIP 占位 HTML 页（bugpk 对 VIP 歌会返回假链接）。关闭可省一次探测请求，但可能发出无法播放的卡片。",
     "default": true
-  },
-  "music_source": {
-    "description": "音源切换（网易云取不到时用哪家）",
-    "type": "string",
-    "hint": "网易云取不到的歌（版权下架的，如周杰伦）按这里的顺序去别家找【同一首原唱】。可选 qq（QQ音乐，默认）/ kugou（酷狗）/ kuwo（酷我），逗号分隔，留空关闭。关键：这一步是在【跑机器人的机器】上直连音源，跟后端部署在哪无关，所以后端在境外也能放周杰伦。注意 QQ音乐 的无损/会员曲目需要下面填 Cookie 才能取到，否则会自动落到酷狗/酷我。",
-    "default": "qq,kugou,kuwo"
-  },
-  "qq_cookie": {
-    "description": "QQ音乐 Cookie（可选）",
-    "type": "string",
-    "hint": "想让 QQ音乐 音源能放会员/无损曲目就填这里，格式如 uin=123456; qqmusic_key=xxxxxx;（浏览器登录 y.qq.com 后从 Cookie 里复制）。留空则 QQ音乐 只能取到免费曲目，取不到会自动换酷狗/酷我。",
-    "default": ""
   },
   "retract_list_seconds": {
     "description": "文字消息自动撤回（秒）",
@@ -57,7 +63,12 @@
   "send_mode": {
     "description": "歌曲发送模式",
     "type": "string",
-    "options": ["card", "file", "voice", "text"],
+    "options": [
+      "card",
+      "file",
+      "voice",
+      "text"
+    ],
     "hint": "card=QQ音乐卡片（失败自动回退文本），file=音乐文件（按歌名命名，发完自动删本地文件），voice=语音，text=文本链接。可用「点歌模式」命令随时切换。",
     "default": "card"
   },
