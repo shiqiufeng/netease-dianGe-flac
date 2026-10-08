@@ -77,9 +77,9 @@ LX_TIMEOUT_SECONDS = 45.0
 """单个音源脚本的执行超时（音源要连它自己的后端，给宽一点）"""
 LX_PLATFORM_CN = {"wy": "网易云", "kw": "酷我", "kg": "酷狗", "tx": "QQ", "mg": "咪咕"}
 MATCH_FAIL_HINT = (
-    "💡 音源服务取不到就发不出歌。版权下架的原唱（如周杰伦）要靠音源服务里的"
-    "跨平台音源去酷我/酷狗找；服务若部署在境外（如 Vercel 默认美国节点）会连不上，"
-    "把服务跑在国内网络即可。"
+    "💡 音源服务取不到就发不出歌。版权下架的原唱（如周杰伦）只有靠音源服务里的"
+    "跨平台音源去别家找（UnblockNeteaseMusic-utils 里是 unm）——它要连 pyncmd/bodian/qq，"
+    "服务部署在境外网络（如 Vercel 默认美国节点）时常常连不上；服务跑在国内或香港节点更稳。"
 )
 """直链获取失败的排查提示"""
 CACHE_JANITOR_SECONDS = 300
@@ -217,6 +217,9 @@ class NeteaseUnblockPlugin(Star):
         self._pending: dict[str, dict] = {}
         self._search_cache: dict[str, tuple] = {}
         self._bad_paths: set[str] = set()  # 后端不存在的取链接口，记住后不再重试
+        # API 地址上是不是 UnblockNeteaseMusic-utils（探一次 /inner/modules 就知道了）
+        self._umn_checked = False
+        self._umn_modules: list[str] | None = None
         # 音源服务单独走代理：本机网络可能对音源域名 TLS 干扰（直连被重置），
         # 而网易云搜索接口直连更快更稳，不跟着走代理。
         self._search_client = httpx.AsyncClient(
@@ -599,7 +602,8 @@ class NeteaseUnblockPlugin(Star):
     async def _match(self, song_id) -> str | None:
         """取可播放直链，自动适配两种后端。
 
-        ① UnblockNeteaseMusic-utils：`/match?id=&source=`
+        ① **UnblockNeteaseMusic-utils**：只有 `/match?id=&source=` 一个接口，
+           识别出它就走这条专用路径（不再去捅它根本没有的 `/song/url/match`）。
         ② 网易云 API Enhanced（自带解灰）：`/song/url/match?id=&source=`，
            再退回 `/song/url/v1?id=&level=&unblock=true`，最后是官方 `/song/url/v1`。
         哪个后端装在 API 地址上就用哪个，装错了也能自己认出来（打不通的路径记下来不再重试）。
@@ -607,7 +611,11 @@ class NeteaseUnblockPlugin(Star):
         if not self.unlock_api:
             return None
 
-        # 解灰类接口：按配置的音源优先级逐个试
+        modules = await self._server_modules()
+        if modules is not None:  # 确认是 UnblockNeteaseMusic-utils
+            return await self._umn_match(song_id, modules)
+
+        # 通用兜底：按配置的音源优先级逐个试解灰接口
         for path in ("/match", "/song/url/match"):
             if path in self._bad_paths:
                 continue
@@ -628,6 +636,56 @@ class NeteaseUnblockPlugin(Star):
             if url:
                 return url
         return None
+
+    async def _server_modules(self) -> list[str] | None:
+        """认一下 API 地址上装的是不是 UnblockNeteaseMusic-utils，是则返回它实际的音源列表。
+
+        `/inner/modules`（读 modules/ 目录下的 .js）是这个项目独有的接口，
+        别的后端没有。返回 None 表示「不是它 / 没探通」，调用方按通用逻辑处理。
+        结果只探一次。
+        """
+        if not self.unlock_api:
+            return None
+        if self._umn_checked:
+            return self._umn_modules
+        self._umn_checked = True
+        self._umn_modules = None
+        try:
+            resp = await self._unlock_client.get(f"{self.unlock_api}/inner/modules")
+            payload = resp.json()
+        except Exception as e:
+            logger.info(f"[netease_unblock] /inner/modules 未探通，按通用后端处理: {e!r}")
+            return None
+        if resp.status_code != 200 or not isinstance(payload, dict) or payload.get("code") != 200:
+            return None
+        data = payload.get("data")
+        modules: list[str] = []
+        if isinstance(data, dict) and isinstance(data.get("modules"), list):
+            modules = [str(m).strip() for m in data["modules"] if str(m).strip()]
+        self._umn_modules = modules
+        logger.info(f"[netease_unblock] {self.unlock_api} = UnblockNeteaseMusic-utils，"
+                    f"可用音源：{'、'.join(modules) or '（服务未列出）'}")
+        return modules
+
+    async def _umn_match(self, song_id: str, modules: list[str]) -> str | None:
+        """走 UnblockNeteaseMusic-utils 的 `/match?id=&source=`。
+
+        先按配置的「音源优先级」逐个试——服务上不存在的音源直接跳过，不白跑一轮请求；
+        都没命中再不带 source 请求一次，让服务端遍历它自己的全部音源（auto）。
+        """
+        configured = [n for n in self._source_list() if n]
+        usable = configured
+        if modules:
+            usable = [n for n in configured if n in modules]
+            skipped = [n for n in configured if n not in modules]
+            if skipped:
+                logger.warning(f"[netease_unblock] 音源 {'、'.join(skipped)} 在服务上不存在，"
+                               f"已跳过（服务实际可用：{'、'.join(modules)}）")
+        for name in usable:
+            url = await self._api_url("/match", {"id": str(song_id), "source": name})
+            if url:
+                return url
+        return await self._api_url("/match", {"id": str(song_id)})
 
     def _source_list(self) -> list[str]:
         """配置里的音源优先级；auto 用空串表示「交给服务端自动选」。"""
@@ -916,9 +974,12 @@ class NeteaseUnblockPlugin(Star):
 
         if not audio:
             api = self.unlock_api or "（未配置 API 地址）"
+            mods = ""
+            if self._umn_modules:
+                mods = f"，该服务音源：{'、'.join(self._umn_modules)}"
             r = await self._say(event, 
                 f"❌ {song['name']} - {song['artists'] or '未知歌手'}\n"
-                f"获取直链失败：音源服务 {api} 没有可用音源或不可达\n"
+                f"获取直链失败：音源服务 {api} 没有可用音源或不可达{mods}\n"
                 f"{MATCH_FAIL_HINT}\n"
                 f"🔗 {link}"
             )
@@ -1764,7 +1825,7 @@ class NeteaseUnblockPlugin(Star):
         await self._react(event)  # 命令回执
         mode = self.send_mode
         tips = (
-            "🎵 网易云音乐点歌-flac v2.5.1\n"
+            "🎵 网易云音乐点歌-flac v2.6.0\n"
             "══════════════════\n"
             "📖 命令（加不加 / 前缀均可）\n"
             "点歌 <歌名>　　　搜索歌曲，回复序号选择\n"

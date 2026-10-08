@@ -2,7 +2,7 @@
   "unlock_api": {
     "description": "API 地址",
     "type": "string",
-    "hint": "填你部署的网易云服务地址（api-enhanced / UnblockNeteaseMusic-utils 都行，插件会用 /match 或 /song/url/match 取直链），末尾不带 /。这是**兜底**：优先用下面配的洛雪音源脚本。",
+    "hint": "填你部署的 UnblockNeteaseMusic-utils 地址（如 https://wy.example.com），末尾不带 /。插件会先请求它的 /inner/modules 认出后端并拿到音源清单，再走 /match?id=&source= 取直链（旧的 api-enhanced 也兼容）。这是**兜底**：优先用下面配的洛雪音源脚本。",
     "default": "",
     "obvious_hint": true
   },
@@ -33,7 +33,7 @@
   "source": {
     "description": "音源优先级（用服务上的哪个音源）",
     "type": "string",
-    "hint": "逗号分隔按顺序尝试【你音源服务里的音源】——插件自己不去连任何音乐平台。可选：unm（跨平台，能取版权下架的周杰伦等）、byfuns、ddyr、gdmusic、msls、oi、qijieya；auto = 交给服务端遍历全部。如 unm,auto 或 byfuns,ddyr,auto。",
+    "hint": "逗号分隔按顺序尝试【你音源服务里的音源】——插件自己不去连任何音乐平台。可选：byfuns、ddyr、msls、oi、qijieya、gdmusic、unm（unm 是唯一跨平台去找别家的，周杰伦这类版权下架原唱要靠它）；auto = 交给服务端遍历全部。服务上没有的名字会被自动跳过（日志会写出服务实际可用哪些）。如 unm,auto 或 byfuns,ddyr,auto。",
     "default": "byfuns,ddyr,auto"
   },
   "verify_audio": {
