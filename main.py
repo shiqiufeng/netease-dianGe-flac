@@ -196,8 +196,6 @@ class NeteaseUnblockPlugin(Star):
         self.auto_pick = bool(config.get("auto_pick") or False)
         _po = config.get("prefer_original")
         self.prefer_original = True if _po is None else bool(_po)
-        _pl = config.get("prefer_lossless")
-        self.prefer_lossless = True if _pl is None else bool(_pl)
         _qf = config.get("qq_fallback")
         self.qq_fallback = True if _qf is None else bool(_qf)
         self.limit = self._safe_int(config.get("limit"), 10)
@@ -617,7 +615,7 @@ class NeteaseUnblockPlugin(Star):
         return self._normalize(songs[0]) if songs else None
 
     async def _match(self, song_id) -> str | None:
-        """取可播放直链，自动适配两种后端；开启「优先无损」时在候选里挑无损。
+        """取可播放直链，自动适配两种后端。
 
         ① **UnblockNeteaseMusic-utils**：只有 `/match?id=&source=` 一个接口，
            识别出它就走这条专用路径（不再去捅它根本没有的 `/song/url/match`）。
@@ -660,30 +658,21 @@ class NeteaseUnblockPlugin(Star):
         return await self._select_url(song_id, attempts)
 
     async def _select_url(self, song_id, attempts: list[tuple[str, dict]]) -> str | None:
-        """按顺序取候选直链；「优先无损」开启时拿到无损（FLAC）才收货。
+        """按音源顺序取第一个可用直链 —— 音质由排在前面的音源上游决定。
 
-        第一个能用的非无损直链记作后备：所有音源都给不了无损时用它兜底，
-        保证功能不回归；拿到无损就立刻返回。
+        插件不做任何无损探测/跨音源择优：服务端各音源在自己的上游 URL 里就写死了
+        音质（byfuns 请求 lossless、ddyr 请求 hires），把无损音源排在 source 最前面
+        即可（默认 `byfuns,ddyr,auto`）。这里只负责「谁能给直链就用谁」。
         """
-        fallback: str | None = None
         for path, params in attempts:
             if path in self._bad_paths:
                 continue
             url = await self._api_url(path, params)
-            if not url:
-                continue
-            if not self.prefer_lossless:
+            if url:
+                logger.info(f"[netease_unblock] 歌曲 {song_id} 命中音源 "
+                            f"{params.get('source') or 'auto'}")
                 return url
-            lossless = await self._is_lossless(url)
-            if lossless:
-                return url
-            if fallback is None:
-                logger.info(f"[netease_unblock] 歌曲 {song_id} 音源 {params.get('source') or 'auto'} "
-                            f"给的不是无损，继续试后面的音源")
-                fallback = url
-        if fallback:
-            logger.info(f"[netease_unblock] 歌曲 {song_id} 所有音源都拿不到无损，用首个可用直链兜底")
-        return fallback
+        return None
 
     async def _server_modules(self) -> list[str] | None:
         """认一下 API 地址上装的是不是 UnblockNeteaseMusic-utils，是则返回它实际的音源列表。
@@ -786,35 +775,6 @@ class NeteaseUnblockPlugin(Star):
         if not ctype or "audio" in ctype or "video" in ctype or "octet-stream" in ctype:
             return True
         return not ctype.startswith("text/")
-
-    async def _is_lossless(self, url: str) -> bool:
-        """探测直链是不是无损（FLAC/WAV/APE）。
-
-        先看扩展名（零请求），再 Range 取头部 64KB 看文件魔数——
-        云盘外链（jdyusic/obj/…mp3）看着也是 audio，但码率由上传者决定，
-        必须看文件头才能确定。探测失败按「非无损」处理，留作后备。
-        """
-        path = url.split("?", 1)[0].lower()
-        if path.endswith((".flac", ".wav", ".ape")):
-            return True
-        try:
-            async with self._unlock_client.stream(
-                "GET", url, headers={"Range": "bytes=0-65535"}
-            ) as resp:
-                head = b""
-                async for chunk in resp.aiter_bytes(65536):
-                    head += chunk
-                    if len(head) >= 65536:
-                        break
-                ctype = (resp.headers.get("content-type") or "").lower()
-        except Exception as e:
-            logger.warning(f"[netease_unblock] 无损探测失败（按非无损处理）: {e!r}")
-            return False
-        if head[:4] == b"fLaC":
-            return True
-        if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
-            return True
-        return "flac" in ctype
 
     # ------------------------------------------------------------------ #
     # QQ 音乐兜底（网易云没版权时发 QQ 卡片）
@@ -1215,7 +1175,7 @@ class NeteaseUnblockPlugin(Star):
     async def _download_song(self, song: dict, url: str) -> Path:
         """流式下载歌曲，按「歌名.格式」命名。
 
-        下完先嗅探文件头确认真实格式：首选无损后直链常是不带扩展名的云盘外链，
+        下完先嗅探文件头确认真实格式：音源直链常是不带扩展名的云盘外链，
         只按 URL 后缀会把 FLAC 存成 .mp3，导致后面的歌词内嵌按 MP3 格式写 tag 而失败。
         判定顺序：文件头 > URL 后缀 > mp3。
         """
@@ -2009,7 +1969,7 @@ class NeteaseUnblockPlugin(Star):
         await self._react(event)  # 命令回执
         mode = self.send_mode
         tips = "\n".join([
-            "🎵 网易云音乐点歌-flac v2.9.0",
+            "🎵 网易云音乐点歌-flac v2.10.0",
             "",
             "【点歌】",
             "  点歌 <歌名> ········· 搜索歌曲，出列表后回复序号",
@@ -2060,7 +2020,7 @@ class NeteaseUnblockPlugin(Star):
             f"  默认发送：{SEND_MODE_CN.get(mode, mode)}"
             + ("（卡片被拒自动回退文本）" if mode == "card" else ""),
             f"  列表 {self.retract_seconds} 秒自动撤回｜免前缀：{'开启' if not self.require_prefix else '关闭'}",
-            f"  音质：{'优先无损（拿不到才用 MP3）' if self.prefer_lossless else '按音源顺序取第一个可用'}",
+            "  音质：按音源顺序取第一个可用（无损由排前面的音源上游决定，默认 byfuns 无损）",
             "  直链来源：UnblockNeteaseMusic-utils 音源服务（版权下架的歌靠它）",
             f"  无版权兜底：{'取不到直链时改发 QQ 音乐卡片' if self.qq_fallback else '关闭（直接报错）'}",
             "",
