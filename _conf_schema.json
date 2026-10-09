@@ -24,12 +24,6 @@
     "hint": "HEAD 探测返回的直链，过滤网易云 VIP 占位 HTML 页（bugpk 对 VIP 歌会返回假链接）。关闭可省一次探测请求，但可能发出无法播放的卡片。",
     "default": true
   },
-  "qq_fallback": {
-    "description": "无版权时改发 QQ 音乐卡片",
-    "type": "bool",
-    "hint": "网易云取不到直链（版权下架 / 音源服务全部失败）时，改为拿歌名去 QQ 音乐搜一首同名歌，发出 QQ 音乐原生卡片，而不是只回一句报错。注意：插件只搜 QQ 音乐的 songmid 来生成卡片，不会去 QQ 音乐取任何音频直链（音频仍只来自 API 地址那个音源服务）。关闭则维持原来的报错文案。",
-    "default": true
-  },
   "retract_list_seconds": {
     "description": "文字消息自动撤回（秒）",
     "type": "int",

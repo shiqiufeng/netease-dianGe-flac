@@ -15,7 +15,7 @@ import re
 import time
 import uuid
 from pathlib import Path, PurePosixPath
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import httpx
 
@@ -106,16 +106,6 @@ HEADERS = {
     "Referer": "https://music.163.com/",
 }
 
-# QQ 音乐：只在「网易云取不到直链」时用来搜一首同名歌的 songmid 发卡片，
-# 不从这里取任何音频直链（音频仍然只来自 API 地址那个音源服务）。
-QQ_SEARCH_API = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
-QQ_SONG_PAGE = "https://y.qq.com/n/ryqq/songDetail/{}"
-QQ_SEARCH_TIMEOUT = 8.0
-QQ_HEADERS = {
-    "User-Agent": HEADERS["User-Agent"],
-    "Referer": "https://y.qq.com/",
-}
-
 _ID_FROM_URL = re.compile(r"[?&]id=(\d+)")
 _PICK_SPLIT_RE = re.compile(r"[,，、;；\s\-—–/]+")
 """序号消息的分隔符：逗号、顿号、空格、连字符（1-2-4-9-10 就靠它拆）"""
@@ -174,17 +164,6 @@ class NeteaseCardMusic(Music):
         return {"type": "music", "data": {"type": "163", "id": int(self.id or 0)}}
 
 
-class QQCardMusic(Music):
-    """QQ 音乐原生卡片（协议端按 songmid 自行渲染）。
-
-    网易云没版权、取不到直链时的兜底：搜到 QQ 音乐的 songmid 后发这张卡，
-    由 QQ 客户端自己播，不需要我们提供任何音频直链。
-    """
-
-    def toDict(self) -> dict:
-        return {"type": "music", "data": {"type": "qq", "id": str(self.id or "")}}
-
-
 class NeteaseUnblockPlugin(Star):
     """网易云音乐点歌-flac：网易云搜索 + 音源服务直链。"""
 
@@ -196,8 +175,6 @@ class NeteaseUnblockPlugin(Star):
         self.auto_pick = bool(config.get("auto_pick") or False)
         _po = config.get("prefer_original")
         self.prefer_original = True if _po is None else bool(_po)
-        _qf = config.get("qq_fallback")
-        self.qq_fallback = True if _qf is None else bool(_qf)
         self.limit = self._safe_int(config.get("limit"), 10)
         self.timeout = self._safe_float(config.get("timeout"), 15.0)
         self.proxy = (config.get("proxy") or "").strip()
@@ -777,94 +754,6 @@ class NeteaseUnblockPlugin(Star):
         return not ctype.startswith("text/")
 
     # ------------------------------------------------------------------ #
-    # QQ 音乐兜底（网易云没版权时发 QQ 卡片）
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _norm_title(text: str) -> str:
-        """去掉空格/标点/括号，用于歌名模糊比对。"""
-        return re.sub(r"[\s\W_]+", "", (text or "").lower())
-
-    def _pick_qq_song(self, items: list, song: dict) -> dict | None:
-        """从 QQ 搜索结果里挑最像原曲的一条（打分制）。
-
-        歌手对上最值钱（+4）——歌名撞车时靠它避开翻唱；歌名完全相同 +3、
-        互相包含 +1。全都没分就退回第一条结果。
-        """
-        want = self._norm_title(song.get("name") or "")
-        artist = (song.get("artists") or "").split("/")[0].strip()
-        want_artist = self._norm_title(artist)
-        best = None
-        best_score = -1
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            mid = it.get("songmid") or it.get("mid")
-            if not mid:
-                continue
-            title = it.get("songname") or it.get("name") or ""
-            singers = it.get("singer") or []
-            who = " / ".join(s.get("name", "") for s in singers if isinstance(s, dict))
-            score = 0
-            got = self._norm_title(title)
-            if want and got:
-                if got == want:
-                    score += 3
-                elif want in got or got in want:
-                    score += 1
-            got_who = self._norm_title(who)
-            if want_artist and got_who and (want_artist in got_who or got_who in want_artist):
-                score += 4
-            if score > best_score:
-                best_score = score
-                best = {"mid": str(mid), "name": title, "singer": who}
-        return best
-
-    async def _qq_searchmid(self, song: dict) -> dict | None:
-        """拿歌名去 QQ 音乐搜一首同名歌，返回 `{'mid','name','singer'}`。
-
-        仅用于生成 QQ 音乐卡片（协议端按 songmid 自己渲染、自己播），
-        **不从这里取任何音频直链**——音频仍然只来自 API 地址那个音源服务。
-        """
-        if not self.qq_fallback:
-            return None
-        name = (song.get("name") or "").strip()
-        if not name:
-            return None
-        artist = (song.get("artists") or "").split("/")[0].strip()
-        query = f"{name} {artist}".strip()
-        try:
-            resp = await self._search_client.get(
-                QQ_SEARCH_API,
-                params={
-                    "format": "json", "p": 1, "n": 8, "w": query,
-                    "cr": 1, "aggr": 0, "new_json": 1, "platform": "yqq.json",
-                },
-                headers=QQ_HEADERS,
-                timeout=QQ_SEARCH_TIMEOUT,
-            )
-            payload = resp.json()
-        except Exception as e:
-            logger.warning(f"[netease_unblock] QQ 音乐搜索失败: {e!r}")
-            return None
-        items = (((payload or {}).get("data") or {}).get("song") or {}).get("list") or []
-        picked = self._pick_qq_song(items, song)
-        if picked:
-            logger.info(f"[netease_unblock] 网易云无直链，QQ 音乐兜底："
-                        f"{picked['name']} - {picked['singer']}（{picked['mid']}）")
-        return picked
-
-    async def _send_qq_card(self, event: AstrMessageEvent, mid: str) -> bool:
-        """发 QQ 音乐原生卡片；非 QQ 平台 / 协议端拒绝时返回 False（改走文字）。"""
-        if event.get_platform_name() != "aiocqhttp" or not hasattr(event, "bot"):
-            return False
-        try:
-            await event.send(MessageChain([QQCardMusic(id=mid)]))
-            return True
-        except Exception as e:
-            logger.warning(f"[netease_unblock] QQ 音乐卡片发送失败: {e!r}")
-            return False
-
-    # ------------------------------------------------------------------ #
     # 发送歌曲
     # ------------------------------------------------------------------ #
     async def _react(self, event: AstrMessageEvent) -> None:
@@ -907,22 +796,7 @@ class NeteaseUnblockPlugin(Star):
             audio = None
 
         if not audio:
-            # 网易云没版权 / 音源服务全失败：改发 QQ 音乐卡片兜底，
-            # 而不是只回一句报错。搜不到再落回原来的报错文案。
-            if self.qq_fallback:
-                qq = await self._qq_searchmid(song)
-                if qq:
-                    if mode == "card" and await self._send_qq_card(event, qq["mid"]):
-                        return
-                    r = await self._say(
-                        event,
-                        f"🎵 {song['name']} - {song['artists'] or '未知歌手'}\n"
-                        f"网易云取不到版权，已转 QQ 音乐：{qq['name']} - {qq['singer']}\n"
-                        f"🔗 {QQ_SONG_PAGE.format(qq['mid'])}"
-                    )
-                    if r is not None:
-                        yield r
-                    return
+            # 网易云没版权 / 音源服务全失败：只回报错，不换别的版本充数。
             api = self.unlock_api or "（未配置 API 地址）"
             mods = ""
             if self._umn_modules:
@@ -1968,63 +1842,39 @@ class NeteaseUnblockPlugin(Star):
     async def _help_flow(self, event: AstrMessageEvent):
         await self._react(event)  # 命令回执
         mode = self.send_mode
+        api = self.unlock_api or "（未配置）"
         tips = "\n".join([
-            "🎵 网易云音乐点歌-flac v2.10.0",
+            "🎵 网易云音乐点歌-flac v2.11.0",
             "",
-            "【点歌】",
-            "  点歌 <歌名> ········· 搜索歌曲，出列表后回复序号",
-            "  点歌 <序号> ········· 直接选上一次列表（支持 1~3 / 1-2-4）",
-            "  点歌卡片 <歌名> ····· 以音乐卡片发送",
-            "  点歌文件 <歌名> ····· 以音乐文件发送",
-            "  点歌语音 <歌名> ····· 以语音条发送",
-            "  点歌消息 <歌名> ····· 以文本链接发送",
-            "  直链 <ID/链接> ······ 按网易云 ID 或分享链接取直链",
-            "  点歌模式 [模式] ····· 查看/切换默认发送方式",
-            "  连播 [首数|序号] ···· 连播当前列表（语音，≤10）",
-            "  帮助 ··············· 本帮助",
+            "【点歌】搜索后回序号选歌，列表 60 秒内有效、可反复回",
+            "  点歌 <歌名>                  搜歌并列出结果",
+            "  点歌 <序号>                  选上一次列表，如「点歌 3」",
+            "  点歌卡片/文件/语音/消息 <歌名>  指定本次的发送方式",
+            "  直链 <ID或链接>              按网易云 ID / 分享链接取直链",
+            "  连播 [首数或序号]            语音连播当前列表（最多 10 首）",
             "",
-            "【找歌】",
-            "  歌词 <歌名|ID> ······ 歌曲歌词",
-            "  排行 [榜单名] ······· 官方排行榜（回复序号看曲目）",
-            "  歌手 <名字> ········· 该歌手热门歌曲",
-            "  专辑 <名字> ········· 专辑曲目",
-            "  歌单 <关键词> ······· 歌单曲目",
-            "  评论 <歌名|ID> ······ 歌曲热评",
-            "  新歌 [地区] ········· 新歌速递：华语/欧美/日本/韩国/全部",
-            "  来首歌 ·············· 随机一首",
+            "【序号怎么写】",
+            "  3           第 3 首",
+            "  1~3         第 1、2、3 首（~ ～ 到 都可以）",
+            "  1-2-4-9-10  第 1、2、4、9、10 首（逗号、空格也一样）",
+            "  0           取消本次选歌",
             "",
-            "【序号怎么回】",
-            f"  列表 {SELECT_TIMEOUT_SECONDS} 秒内有效，可以连着回复多次，每次回复都会重新计时",
-            "  3 ········· 单首，就发第 3 首",
-            "  1~3 ······· 连号，发第 1、2、3 首（~ ～ 到 都可以）",
-            "  5~7 ······· 发第 5、6、7 首",
-            "  1~10 ······ 发第 1 到 10 首",
-            "  1-2-4-9-10 · 多选，就发第 1、2、4、9、10 首",
-            "  1,3,5 ····· 逗号多选，同 1-3-5",
-            "  1 4 7 ····· 空格分隔，同 1-4-7",
-            "  0 ········· 取消本次选歌",
-            f"  单条最多 {MAX_BATCH_PICKS} 首；点歌/排行/歌手/专辑/歌单/新歌 的列表都支持",
+            "【找歌】出的列表同样可以回序号点歌",
+            "  歌词 <歌名|ID>   排行 [榜单]   歌手 <名字>   专辑 <名字>",
+            "  歌单 <关键词>    评论 <歌名|ID>   新歌 [地区]   来首歌",
             "",
-            "【示例】",
-            "  点歌 咏春              → 出 10 首列表",
-            "  3                     → 发第 3 首（列表还有效，可继续发 1）",
-            "  1~3                   → 连着发第 1、2、3 首",
-            "  1-2-4-9-10            → 发这 5 首",
-            "  点歌文件 咏春          → 直接发文件，不出列表",
-            "  歌手 周杰伦 → 1~5      → 周杰伦热门前 5 首",
-            "  排行 → 2 → 1~5        → 第 2 个榜单的前 5 首",
-            "  直链 1498523311        → 按 ID 取直链",
-            "  点歌模式 文件           → 之后默认发文件",
+            "【其它】",
+            "  点歌模式 [卡片|文件|语音|文本]  查看或切换默认发送方式",
+            "  帮助                          本帮助",
             "",
-            "【当前状态】",
-            f"  默认发送：{SEND_MODE_CN.get(mode, mode)}"
-            + ("（卡片被拒自动回退文本）" if mode == "card" else ""),
-            f"  列表 {self.retract_seconds} 秒自动撤回｜免前缀：{'开启' if not self.require_prefix else '关闭'}",
-            "  音质：按音源顺序取第一个可用（无损由排前面的音源上游决定，默认 byfuns 无损）",
-            "  直链来源：UnblockNeteaseMusic-utils 音源服务（版权下架的歌靠它）",
-            f"  无版权兜底：{'取不到直链时改发 QQ 音乐卡片' if self.qq_fallback else '关闭（直接报错）'}",
+            "以上命令免唤醒，直接发即可（带 / 前缀也行）",
             "",
-            "【作者】流水 · 听雨的蛙 · 落雪 · GLM-5.3-Flash",
+            f"当前：默认发{SEND_MODE_CN.get(mode, mode)}"
+            + ("（卡片被拒自动回退文本）" if mode == "card" else "")
+            + f"｜列表 {self.retract_seconds} 秒自动撤回"
+            + f"｜免前缀 {'开启' if not self.require_prefix else '关闭'}",
+            f"音源：{api}（按「音源优先级」顺序取第一个可用直链）",
+            "作者：流水 · 听雨的蛙 · 落雪 · GLM-5.3-Flash",
         ])
         r = await self._say(event, tips)
         if r is not None:
