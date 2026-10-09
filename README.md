@@ -10,7 +10,7 @@ AstrBot 点歌插件：搜网易云音乐，直链由你自己部署的 [Unblock
 - **搜歌 + 回序号点歌**：`点歌 歌名` 出列表，回 `3` 发第 3 首；列表 **60 秒内可反复回**，还能连号 `1~3`、多选 `1-2-4-9-10`
 - **优先原唱**：搜索前排常被翻唱占据，插件按原唱标注/发行时间把原唱换回来；想点翻唱就在关键词里写明（如 `点歌 稻香 深情版`）
 - **直链只走音源服务**：插件**不会**去连 QQ音乐/酷狗/酷我，只问 `API 地址` 那个服务要直链；**所有音源都取不到就直接报错**，不拿翻唱版充数，换源静默无提示
-- **音质由音源顺序决定**：按 `音源优先级` 取**第一个可用直链**就算数，音质看排前面的音源上游给什么（`byfuns`=无损、`ddyr`=Hi-Res，默认即无损）
+- **音源顺序可自定义，顺序同时决定音质**：按 `音源优先级` **依次请求**，谁先给出可用直链就用谁。默认 `ddyr,byfuns,msls,oi,qijieya,auto`——先 `ddyr`（Hi-Res），没有再 `byfuns`（无损），再依次 `msls` → `oi` → `qijieya`，最后让服务端 `auto` 兜底；音质看排前面的音源上游给什么
 - **四种发送方式**：卡片 / 文件（自动内嵌歌词与封面）/ 语音 / 文本，可用 `点歌模式` 随时切换
 - 所有命令触发时贴表情回执；插件发出的文字消息默认 60 秒后自动撤回（仅 aiocqhttp）
 
@@ -56,7 +56,7 @@ AstrBot 点歌插件：搜网易云音乐，直链由你自己部署的 [Unblock
 | --- | --- | --- |
 | `API 地址`（unlock_api） | 空 | **必填**。填你部署的 UnblockNeteaseMusic-utils 地址（末尾不带 `/`）。插件先探 `/inner/modules` 认后端并拿音源清单，再走 `/match?id=&source=` 取直链；旧 api-enhanced 也兼容 |
 | `音源请求代理`（proxy） | 空 | 访问音源服务走的代理，如 `http://127.0.0.1:7897`。仅音源请求走代理，搜索仍直连 |
-| `音源优先级`（source） | `byfuns,ddyr,auto` | 逗号分隔，按顺序用**音源服务上的哪个音源**，**顺序同时决定音质**（取第一个可用就发，把请求无损的音源排前面）。可选 `byfuns` `ddyr` `msls` `oi` `qijieya` `gdmusic` `unm`；`auto` = 服务端遍历全部。写错的名字自动跳过 |
+| `音源优先级`（source） | `ddyr,byfuns,msls,oi,qijieya,auto` | 逗号分隔，**按顺序依次请求音源服务上的音源**，谁先给出可用直链就用谁——**这个顺序同时决定音质**。默认先 `ddyr`（Hi-Res）→ `byfuns`（无损）→ `msls` → `oi` → `qijieya` → `auto`（服务端遍历全部兜底）。可选 `byfuns` `ddyr` `msls` `oi` `qijieya` `gdmusic` `unm`；写错的名字自动跳过 |
 | `校验音频直链`（verify_audio） | `true` | HEAD 探测直链，过滤 VIP 占位 HTML 假链接 |
 | `自动点第一首`（auto_pick） | `false` | 开启后点歌直接发第一首，不再列序号 |
 | `优先原唱`（prefer_original） | `true` | 把搜索前排的翻唱换成网易云标注的原唱 |
@@ -104,13 +104,16 @@ npm start    # 默认 3000 端口
 
 **内置音源**（`modules/` 目录，删掉 `.js` 即下线）：
 
-| 音源 | 走哪里 |
-| --- | --- |
-| `byfuns` | `api.byfuns.top`，默认请求无损 |
-| `ddyr` | `yy.zddyr.top/lx/api`，默认请求 Hi-Res |
-| `msls` / `oi` / `qijieya` | `api.msls1441.com` / `oiapi.net` / `api.qijieya.cn` |
-| `gdmusic` | `music-api.gdstudio.xyz` |
-| `unm` | `@unblockneteasemusic/server`（pyncmd/bodian/qq）——**唯一跨平台找别家的，周杰伦这类下架原唱靠它** |
+| 音源 | 走哪里 | 默认顺序 |
+| --- | --- | --- |
+| `ddyr` | `yy.zddyr.top/lx/api`，上游请求 Hi-Res | ① |
+| `byfuns` | `api.byfuns.top`，上游请求无损 | ② |
+| `msls` | `api.msls1441.com` | ③ |
+| `oi` | `oiapi.net` | ④ |
+| `qijieya` | `api.qijieya.cn/meting` | ⑤ |
+| `auto` | 不带 `source`，服务端遍历它自己的全部音源 | ⑥ 兜底 |
+| `gdmusic` | `music-api.gdstudio.xyz` | 未列入默认顺序 |
+| `unm` | `@unblockneteasemusic/server`（pyncmd/bodian/qq）——**唯一跨平台找别家的，周杰伦这类下架原唱靠它** | 未列入默认顺序 |
 
 **部署后验证**：
 
@@ -130,6 +133,7 @@ curl "<你的API地址>/match?id=347230"  # 能返回 data.url 才算正常
 - **提示「获取直链失败」**：错误里会带上 API 地址、该服务实际音源与排查提示。依次查：① `curl "<API>/inner/modules"` 看服务活没活；② `curl "<API>/match?id=<歌曲ID>&source=<音源名>"` 看是不是这首歌上游本来就没有（换个 ID 对比）；③ 本机对该域名 TLS 被重置时，在 `音源请求代理` 填本机代理。
 - **周杰伦这类歌取不到**：网易云自己就不给放，只能靠服务里能跨平台找的 `unm`；它连不上别家（Vercel 美国节点常见）就失败。逐个音源实测后决定 `音源优先级` 怎么填。
 - **点歌给了翻唱**：搜索接口本身就这么排，插件默认开启「优先原唱」会换回原唱；仍不对就 `直链 <原唱歌曲ID>` 精确点歌。
+- **换了默认音源顺序却没生效**：AstrBot 会把配置值存进配置文件，`音源优先级` 里存有旧值（如 `byfuns,ddyr,auto`）时以存下来的为准，新的默认值只对没配过该项的实例生效。手动改成 `ddyr,byfuns,msls,oi,qijieya,auto` 再重载插件即可。
 - **卡片发出来不能播**：多为直链失效或上游限流，换 `音源优先级` 里的音源再试。
 - **音乐卡片 / 表情回应仅 aiocqhttp 平台支持**（NapCat / Lagrange / go-cqhttp），卡片失败自动回退文本。
 

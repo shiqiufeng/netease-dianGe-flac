@@ -15,8 +15,8 @@
   "source": {
     "description": "音源优先级（用服务上的哪个音源，也决定音质）",
     "type": "string",
-    "hint": "逗号分隔按顺序尝试【你音源服务里的音源】——插件自己不去连任何音乐平台。音质由排在前面的音源上游决定：byfuns 请求无损(lossless)、ddyr 请求 Hi-Res，默认把 byfuns,ddyr 排前面即可拿到无损。可选：byfuns、ddyr、msls、oi、qijieya、gdmusic、unm（unm 是唯一跨平台去找别家的，周杰伦这类版权下架原唱要靠它）；auto = 交给服务端遍历全部。服务上没有的名字会被自动跳过（日志会写出服务实际可用哪些）。如 unm,auto 或 byfuns,ddyr,auto。",
-    "default": "byfuns,ddyr,auto"
+    "hint": "逗号分隔，按顺序依次请求【你音源服务里的音源】——插件自己不去连任何音乐平台；谁先给出可用直链就用谁，所以这个顺序同时决定音质。默认 ddyr,byfuns,msls,oi,qijieya,auto：先用 ddyr（上游请求 Hi-Res），没有再用 byfuns（上游请求无损 lossless），再依次 msls → oi → qijieya，最后 auto = 让服务端遍历它自己的全部音源兜底。可选：byfuns、ddyr、msls、oi、qijieya、gdmusic、unm（unm 是唯一跨平台去找别家的，周杰伦这类版权下架原唱要靠它）。服务上没有的名字会被自动跳过（日志会写出服务实际可用哪些）。",
+    "default": "ddyr,byfuns,msls,oi,qijieya,auto"
   },
   "verify_audio": {
     "description": "校验音频直链",

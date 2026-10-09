@@ -638,8 +638,9 @@ class NeteaseUnblockPlugin(Star):
         """按音源顺序取第一个可用直链 —— 音质由排在前面的音源上游决定。
 
         插件不做任何无损探测/跨音源择优：服务端各音源在自己的上游 URL 里就写死了
-        音质（byfuns 请求 lossless、ddyr 请求 hires），把无损音源排在 source 最前面
-        即可（默认 `byfuns,ddyr,auto`）。这里只负责「谁能给直链就用谁」。
+        音质（ddyr 请求 hires、byfuns 请求 lossless），想优先高音质就把对应音源排在
+        source 最前面（默认 `ddyr,byfuns,msls,oi,qijieya,auto`）。这里只负责
+        「谁能给直链就用谁」。
         """
         for path, params in attempts:
             if path in self._bad_paths:
@@ -1844,7 +1845,7 @@ class NeteaseUnblockPlugin(Star):
         mode = self.send_mode
         api = self.unlock_api or "（未配置）"
         tips = "\n".join([
-            "🎵 网易云音乐点歌-flac v2.11.0",
+            "🎵 网易云音乐点歌-flac v2.12.0",
             "",
             "【点歌】搜索后回序号选歌，列表 60 秒内有效、可反复回",
             "  点歌 <歌名>                  搜歌并列出结果",
